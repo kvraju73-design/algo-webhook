@@ -1,0 +1,6 @@
+{
+  "deploy": {
+    "startCommand": "gunicorn app:app",
+    "restartPolicyType": "ALWAYS"
+  }
+}
