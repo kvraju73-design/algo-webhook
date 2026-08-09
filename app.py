@@ -3,6 +3,7 @@ Flattrade MULTI-INSTRUMENT - CLOUD VERSION for Railway v3
 =========================================================
 Supports: NIFTY, BANKNIFTY, CRUDEOIL
 Auto-detects instrument + CE/PE from symbol in alert
+AUTO-LOGIN: Generates token automatically using TOTP (no manual intervention)
 """
 
 import os
@@ -14,10 +15,13 @@ import re
 import threading
 import time
 import requests
+import pyotp                          # NEW: for TOTP auto-generation
 from datetime import datetime, time as dtime
 from flask import Flask, request, jsonify, render_template_string
 import pytz
 
+# =============================================
+# EXISTING VARIABLES (already in Railway)
 # =============================================
 USER_ID        = os.environ.get("USER_ID", "")
 API_KEY        = os.environ.get("API_KEY", "")
@@ -30,16 +34,32 @@ PRODUCT        = os.environ.get("PRODUCT", "M")
 DRY_RUN        = os.environ.get("DRY_RUN", "False").lower() == "true"
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 
+# =============================================
+# NEW VARIABLES - Add these 3 to Railway
+# =============================================
+# Go to Railway → Your Project → Variables → Add:
+# FLATTRADE_PASSWORD  = your login password
+# FLATTRADE_TOTP_KEY  = your authenticator secret key (the words below QR code)
+# AUTO_LOGIN_ENABLED  = true
+FLATTRADE_PASSWORD   = os.environ.get("FLATTRADE_PASSWORD", "")
+FLATTRADE_TOTP_KEY   = os.environ.get("FLATTRADE_TOTP_KEY", "")
+AUTO_LOGIN_ENABLED   = os.environ.get("AUTO_LOGIN_ENABLED", "false").lower() == "true"
+
+# =============================================
 PROXIES = {
     "http":  f"http://{PROXY_USER}:{PROXY_PASS}@{PROXY_HOST}:{PROXY_PORT}",
     "https": f"http://{PROXY_USER}:{PROXY_PASS}@{PROXY_HOST}:{PROXY_PORT}",
 } if PROXY_HOST else None
 
-TOKEN_URL      = "https://authapi.flattrade.in/trade/apitoken"
+# =============================================
+# FLATTRADE API ENDPOINTS
+# =============================================
+AUTH_LOGIN_URL = "https://authapi.flattrade.in/auth/session"   # Auto-login endpoint
+TOKEN_URL      = "https://authapi.flattrade.in/trade/apitoken" # Manual token endpoint
 BASE_URL_ORDER = "https://piconnect.flattrade.in/PiConnectAPI"
 
 # =============================================
-# INSTRUMENT CONFIGURATION
+# INSTRUMENT CONFIGURATION (unchanged)
 # =============================================
 INSTRUMENTS = {
     "NIFTY": {
@@ -62,10 +82,9 @@ INSTRUMENTS = {
     },
 }
 
-# Default fallback if instrument can't be detected
 DEFAULT_LOT_SIZE = 65
-# =============================================
 
+# =============================================
 logging.basicConfig(level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)])
@@ -73,13 +92,15 @@ log = logging.getLogger(__name__)
 logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
 state = {
-    "token":       None,
-    "call_symbol": "",
-    "put_symbol":  "",
-    "instrument":  "NIFTY",  # for /setup page default
-    "qty":         DEFAULT_LOT_SIZE,
-    "logs":        [],
-    "last_action": {},
+    "token":            None,
+    "call_symbol":      "",
+    "put_symbol":       "",
+    "instrument":       "NIFTY",
+    "qty":              DEFAULT_LOT_SIZE,
+    "logs":             [],
+    "last_action":      {},
+    "last_login_time":  None,     # NEW: track when last auto-login happened
+    "login_status":     "Never",  # NEW: "Success" / "Failed" / "Never"
 }
 
 IST = pytz.timezone("Asia/Kolkata")
@@ -90,15 +111,13 @@ def add_log(msg):
     state["logs"] = state["logs"][-200:]
     log.info(msg)
 
-# -----------------------------------------------
-# INSTRUMENT DETECTION FROM SYMBOL
-# -----------------------------------------------
+# =============================================
+# INSTRUMENT DETECTION (unchanged)
+# =============================================
 def detect_instrument(symbol):
-    """Returns instrument name from symbol prefix"""
     if not symbol:
         return None
     symbol = symbol.upper()
-    # Check longest prefix first (BANKNIFTY before NIFTY)
     if symbol.startswith("BANKNIFTY"):
         return "BANKNIFTY"
     if symbol.startswith("CRUDEOIL"):
@@ -108,7 +127,6 @@ def detect_instrument(symbol):
     return None
 
 def detect_option_type(symbol):
-    """Returns 'CE' or 'PE' from symbol"""
     if not symbol:
         return None
     symbol = symbol.upper()
@@ -119,49 +137,199 @@ def detect_option_type(symbol):
     return None
 
 def get_instrument_config(symbol):
-    """Get exchange, lot_size, market hours for given symbol"""
     instrument = detect_instrument(symbol)
     if instrument and instrument in INSTRUMENTS:
         return instrument, INSTRUMENTS[instrument]
     return None, None
 
 def is_market_open_for(instrument):
-    """Check market hours for specific instrument"""
     if instrument not in INSTRUMENTS:
         return False
     cfg = INSTRUMENTS[instrument]
     now = datetime.now(IST).time()
     return cfg["market_open"] <= now <= cfg["market_close"]
 
-# -----------------------------------------------
-# TOKEN
-# -----------------------------------------------
+# =============================================
+# TOKEN - MANUAL LOGIN (your existing code - unchanged)
+# =============================================
 def sha256(text):
     return hashlib.sha256(text.encode()).hexdigest()
 
 def exchange_request_code(request_code):
+    """Your existing manual login - kept as fallback"""
     hash_value = sha256(API_KEY + request_code + API_SECRET)
-    payload = {"api_key": API_KEY, "request_code": request_code, "api_secret": hash_value}
+    payload = {
+        "api_key": API_KEY,
+        "request_code": request_code,
+        "api_secret": hash_value
+    }
     try:
         r = requests.post(TOKEN_URL, json=payload, proxies=PROXIES, timeout=15)
         resp = r.json()
     except Exception as e:
         add_log(f"[LOGIN] Failed: {e}")
         return False, str(e)
+
     if resp.get("stat") != "Ok":
         err = resp.get("emsg", str(resp))
         add_log(f"[LOGIN] Failed: {err}")
         return False, err
+
     token = resp.get("token") or resp.get("susertoken")
     if not token:
         return False, "No token returned"
+
     state["token"] = token
-    add_log("[LOGIN] Token generated successfully.")
+    state["last_login_time"] = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
+    state["login_status"] = "Success (Manual)"
+    add_log("[LOGIN] Token generated successfully via manual login.")
     return True, "OK"
 
-# -----------------------------------------------
-# API CALLS (now instrument-aware)
-# -----------------------------------------------
+# =============================================
+# NEW: AUTO LOGIN FUNCTION
+# =============================================
+def auto_login():
+    """
+    Automatically logs in to Flattrade using:
+    - USER_ID (already in Railway)
+    - FLATTRADE_PASSWORD (add to Railway)
+    - FLATTRADE_TOTP_KEY (add to Railway - the words below QR code)
+    - API_KEY (already in Railway)
+    - API_SECRET (already in Railway)
+    """
+    add_log("[AUTO-LOGIN] Starting automatic login...")
+
+    # Check if all required credentials are present
+    missing = []
+    if not USER_ID:          missing.append("USER_ID")
+    if not FLATTRADE_PASSWORD: missing.append("FLATTRADE_PASSWORD")
+    if not FLATTRADE_TOTP_KEY: missing.append("FLATTRADE_TOTP_KEY")
+    if not API_KEY:          missing.append("API_KEY")
+    if not API_SECRET:       missing.append("API_SECRET")
+
+    if missing:
+        msg = f"[AUTO-LOGIN] Missing Railway variables: {', '.join(missing)}"
+        add_log(msg)
+        state["login_status"] = f"Failed - Missing: {', '.join(missing)}"
+        return False
+
+    try:
+        # Step 1: Generate TOTP automatically (replaces your Google Authenticator)
+        totp = pyotp.TOTP(FLATTRADE_TOTP_KEY)
+        totp_code = totp.now()
+        add_log(f"[AUTO-LOGIN] TOTP generated successfully ({totp_code})")
+
+        # Step 2: Hash the password (Flattrade requires SHA256)
+        hashed_pwd = sha256(FLATTRADE_PASSWORD)
+
+        # Step 3: Login to get request_code
+        login_payload = {
+            "uid":     USER_ID,
+            "pwd":     hashed_pwd,
+            "factor2": totp_code,
+            "appkey":  API_KEY,
+            "imei":    "auto_login_railway",
+            "source":  "API"
+        }
+
+        add_log("[AUTO-LOGIN] Sending login request to Flattrade...")
+        login_resp = requests.post(
+            AUTH_LOGIN_URL,
+            json=login_payload,
+            proxies=PROXIES,
+            timeout=15
+        )
+        login_data = login_resp.json()
+        add_log(f"[AUTO-LOGIN] Login response: {login_data.get('stat')} | {login_data.get('emsg', '')}")
+
+        if login_data.get("stat") != "Ok":
+            err = login_data.get("emsg", str(login_data))
+            add_log(f"[AUTO-LOGIN] Login step failed: {err}")
+            state["login_status"] = f"Failed - {err}"
+            return False
+
+        # Step 4: Extract request_code from login response
+        request_code = login_data.get("request_code") or login_data.get("susertoken")
+        if not request_code:
+            add_log(f"[AUTO-LOGIN] No request_code in response: {login_data}")
+            state["login_status"] = "Failed - No request_code"
+            return False
+
+        # Step 5: Exchange request_code for access token (same as your manual process)
+        add_log("[AUTO-LOGIN] Exchanging request_code for access token...")
+        success, result = exchange_request_code(request_code)
+
+        if success:
+            state["login_status"] = "Success (Auto)"
+            state["last_login_time"] = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
+            add_log("[AUTO-LOGIN] ✅ Auto-login completed! Token is active.")
+            return True
+        else:
+            state["login_status"] = f"Failed - {result}"
+            add_log(f"[AUTO-LOGIN] ❌ Token exchange failed: {result}")
+            return False
+
+    except Exception as e:
+        add_log(f"[AUTO-LOGIN] ❌ Exception: {e}")
+        state["login_status"] = f"Failed - Exception: {e}"
+        return False
+
+# =============================================
+# NEW: SCHEDULED AUTO LOGIN (runs daily at 8:30 AM IST)
+# =============================================
+def scheduled_auto_login():
+    """
+    Background thread that:
+    1. Runs auto-login at startup
+    2. Refreshes token every day at 8:30 AM IST
+    3. Retries every 5 minutes if login fails
+    """
+    add_log("[SCHEDULER] Auto-login scheduler started.")
+
+    # Wait 10 seconds after startup before first login attempt
+    time.sleep(10)
+
+    if AUTO_LOGIN_ENABLED:
+        add_log("[SCHEDULER] Attempting startup auto-login...")
+        auto_login()
+    else:
+        add_log("[SCHEDULER] AUTO_LOGIN_ENABLED=false. Skipping auto-login.")
+        add_log("[SCHEDULER] Set AUTO_LOGIN_ENABLED=true in Railway variables to enable.")
+
+    while True:
+        try:
+            now = datetime.now(IST)
+
+            # Refresh token daily at 8:30 AM IST
+            if AUTO_LOGIN_ENABLED and now.hour == 8 and now.minute == 30:
+                add_log("[SCHEDULER] 8:30 AM IST - Running daily token refresh...")
+                success = auto_login()
+                if not success:
+                    # Retry every 5 minutes if failed
+                    add_log("[SCHEDULER] Login failed. Will retry in 5 minutes...")
+                    for _ in range(5):
+                        time.sleep(60)
+                        add_log("[SCHEDULER] Retrying login...")
+                        if auto_login():
+                            break
+                # Sleep 61 seconds to avoid double-trigger
+                time.sleep(61)
+
+            # Also refresh if token is missing (e.g., after Railway restart)
+            if AUTO_LOGIN_ENABLED and not state["token"]:
+                add_log("[SCHEDULER] Token missing! Attempting re-login...")
+                auto_login()
+                time.sleep(300)  # Wait 5 mins before checking again
+
+            time.sleep(30)  # Check every 30 seconds
+
+        except Exception as e:
+            add_log(f"[SCHEDULER] Error: {e}")
+            time.sleep(60)
+
+# =============================================
+# YOUR EXISTING API CALLS (completely unchanged)
+# =============================================
 def get_token_for_symbol(symbol, exchange):
     try:
         r = requests.post(BASE_URL_ORDER + "/SearchScrip",
@@ -202,8 +370,6 @@ def get_ltp(symbol, exchange):
 
 def place_order(symbol, trantype, qty=None):
     action = "BUY" if trantype == "B" else "SELL"
-
-    # Auto-detect instrument config
     instrument, cfg = get_instrument_config(symbol)
     if not cfg:
         add_log(f"[ORDER] ERROR: Unknown instrument for symbol {symbol}")
@@ -211,11 +377,10 @@ def place_order(symbol, trantype, qty=None):
 
     exchange = cfg["exchange"]
     qty = qty or cfg["lot_size"]
-
     add_log(f"[ORDER] {action} → {symbol} | qty={qty} | {instrument} ({exchange})")
 
     if not state["token"]:
-        add_log("[ORDER] ERROR: No token. Visit /login first!")
+        add_log("[ORDER] ERROR: No token. Auto-login may have failed. Check /logs")
         return None
 
     if not DRY_RUN and not is_market_open_for(instrument):
@@ -259,7 +424,6 @@ def place_order(symbol, trantype, qty=None):
 
 def exit_position(symbol, qty=None):
     add_log(f"[EXIT] Triggered for {symbol}")
-
     instrument, cfg = get_instrument_config(symbol)
     if not cfg:
         add_log(f"[EXIT] ERROR: Unknown instrument for {symbol}")
@@ -268,7 +432,7 @@ def exit_position(symbol, qty=None):
     exchange = cfg["exchange"]
 
     if not state["token"]:
-        add_log("[EXIT] ERROR: No token. Visit /login first!")
+        add_log("[EXIT] ERROR: No token. Auto-login may have failed. Check /logs")
         return
 
     if not DRY_RUN and not is_market_open_for(instrument):
@@ -329,13 +493,12 @@ def exit_position(symbol, qty=None):
     except Exception as e:
         add_log(f"[EXIT] Exception: {e}")
 
-# -----------------------------------------------
-# ACTION HANDLER
-# -----------------------------------------------
+# =============================================
+# ACTION HANDLER (unchanged)
+# =============================================
 def handle_action(action, qty=None, symbol=None):
     action = action.upper().strip()
 
-    # Debounce
     dedup_key = f"{action}_{symbol or ''}"
     now = time.time()
     if now - state["last_action"].get(dedup_key, 0) < 2:
@@ -343,13 +506,11 @@ def handle_action(action, qty=None, symbol=None):
         return
     state["last_action"][dedup_key] = now
 
-    # ---- Dynamic: symbol from TradingView alert ----
     if symbol:
         symbol = symbol.strip().upper()
         instrument = detect_instrument(symbol)
         opt_type = detect_option_type(symbol)
 
-        # Use instrument's lot size if qty not specified
         if not qty and instrument in INSTRUMENTS:
             qty = INSTRUMENTS[instrument]["lot_size"]
         elif not qty:
@@ -367,7 +528,6 @@ def handle_action(action, qty=None, symbol=None):
             add_log(f"[ACTION] Unknown action: {action}")
         return
 
-    # ---- Fallback: use pre-configured CE/PE from /setup ----
     ce = state["call_symbol"]
     pe = state["put_symbol"]
     qty = qty or state["qty"]
@@ -392,9 +552,9 @@ def handle_action(action, qty=None, symbol=None):
     else:
         add_log(f"[ACTION] Unknown: {action}")
 
-# -----------------------------------------------
+# =============================================
 # FLASK APP
-# -----------------------------------------------
+# =============================================
 app = Flask(__name__)
 
 HOME_HTML = """
@@ -411,13 +571,20 @@ table{width:100%;border-collapse:collapse;background:#16213e;border-radius:8px;o
 th,td{padding:10px;text-align:left;border-bottom:1px solid #0f3460;}
 th{background:#0f3460;color:#ffd700;}
 code{background:#0a0e27;padding:3px 6px;border-radius:3px;color:#00d9ff;}
+.auto-badge{background:#1b5e20;padding:4px 10px;border-radius:12px;font-size:12px;margin-left:8px;}
+.manual-badge{background:#e65100;padding:4px 10px;border-radius:12px;font-size:12px;margin-left:8px;}
 </style></head><body>
 <h1>🚀 Flattrade Algo — Multi-Instrument v3</h1>
 
 <div class="status">
-<b>Token:</b> <span class="{{'ok' if token else 'err'}}">{{'✅ Active' if token else '❌ Not logged in'}}</span><br>
-<b>Mode:</b> <span class="{{'warn' if dry else 'ok'}}">{{'DRY RUN' if dry else 'LIVE'}}</span><br>
-<b>Server Time (IST):</b> {{time_now}}
+<b>Token:</b> <span class="{{ 'ok' if token else 'err' }}">{{ '✅ Active' if token else '❌ Not logged in' }}</span><br>
+<b>Auto-Login:</b> <span class="{{ 'ok' if auto_login_enabled else 'warn' }}">
+  {{ '✅ Enabled' if auto_login_enabled else '⚠️ Disabled (Set AUTO_LOGIN_ENABLED=true in Railway)' }}
+</span><br>
+<b>Login Status:</b> <span class="{{ 'ok' if 'Success' in login_status else 'err' }}">{{ login_status }}</span><br>
+<b>Last Login:</b> {{ last_login_time or 'Never' }}<br>
+<b>Mode:</b> <span class="{{ 'warn' if dry else 'ok' }}">{{ 'DRY RUN' if dry else 'LIVE' }}</span><br>
+<b>Server Time (IST):</b> {{ time_now }}
 </div>
 
 <h2>📊 Supported Instruments</h2>
@@ -435,12 +602,13 @@ code{background:#0a0e27;padding:3px 6px;border-radius:3px;color:#00d9ff;}
 </table>
 
 <h2>Quick Actions</h2>
-<a href="/login">🔑 Daily Login</a>
-<a href="/setup">⚙️ Strike Setup (Optional)</a>
+<a href="/autologin">⚡ Trigger Auto-Login Now</a>
+<a href="/login">🔑 Manual Login (Fallback)</a>
+<a href="/setup">⚙️ Strike Setup</a>
 <a href="/logs">📋 View Logs</a>
 <a href="/health">💚 Health</a>
 
-<h2>🔗 Webhook URL for TradingView (USE HTTPS!)</h2>
+<h2>🔗 Webhook URL</h2>
 <div class="status"><code>https://{{host}}/webhook</code></div>
 
 <h2>📝 Alert JSON Examples</h2>
@@ -455,10 +623,6 @@ code{background:#0a0e27;padding:3px 6px;border-radius:3px;color:#00d9ff;}
 <code>{"action":"BUY","symbol":"CRUDEOIL20AUG26C6500","qty":"100"}</code><br>
 <code>{"action":"SELL","symbol":"CRUDEOIL20AUG26P6300","qty":"100"}</code>
 </div>
-
-<p style="color:#888;font-size:12px;margin-top:30px;">
-💡 Instrument auto-detected from symbol prefix. Lot size auto-applied. Market hours auto-checked.
-</p>
 </body></html>
 """
 
@@ -466,11 +630,35 @@ code{background:#0a0e27;padding:3px 6px;border-radius:3px;color:#00d9ff;}
 def home():
     market_status = {name: is_market_open_for(name) for name in INSTRUMENTS}
     return render_template_string(HOME_HTML,
-        token=state["token"], dry=DRY_RUN,
-        instruments=INSTRUMENTS, market_status=market_status,
+        token=state["token"],
+        dry=DRY_RUN,
+        auto_login_enabled=AUTO_LOGIN_ENABLED,
+        login_status=state["login_status"],
+        last_login_time=state["last_login_time"],
+        instruments=INSTRUMENTS,
+        market_status=market_status,
         time_now=datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
         host=request.host)
 
+# NEW: Trigger auto-login manually from browser
+@app.route("/autologin")
+def trigger_auto_login():
+    if not AUTO_LOGIN_ENABLED:
+        return """<div style='font-family:Arial;background:#1a1a2e;color:#eee;padding:30px;'>
+        ❌ AUTO_LOGIN_ENABLED is false in Railway variables.<br>
+        Set AUTO_LOGIN_ENABLED=true and redeploy.<br><br>
+        <a href='/' style='color:#00d9ff'>← Back</a></div>"""
+
+    success = auto_login()
+    msg = "✅ Auto-login successful! Token is now active." if success else "❌ Auto-login failed. Check /logs"
+    color = "#1b5e20" if success else "#b71c1c"
+    return f"""<div style='font-family:Arial;background:#1a1a2e;color:#eee;padding:30px;'>
+    <div style='background:{color};padding:20px;border-radius:8px;'>
+    {msg}<br>Status: {state['login_status']}</div><br>
+    <a href='/' style='color:#00d9ff'>← Back</a>
+    <a href='/logs' style='color:#00d9ff;margin-left:10px;'>View Logs</a></div>"""
+
+# Your existing manual login (unchanged - kept as fallback)
 LOGIN_HTML = """
 <!DOCTYPE html><html><head><title>Login</title>
 <style>body{font-family:Arial;background:#1a1a2e;color:#eee;padding:30px;max-width:700px;margin:auto;}
@@ -481,8 +669,11 @@ input{width:100%;padding:10px;font-size:16px;background:#0f3460;color:white;bord
 .step{margin:20px 0;padding:15px;background:#0f3460;border-left:4px solid #00d9ff;}
 .msg{padding:15px;border-radius:5px;margin:15px 0;}
 .ok{background:#1b5e20;}.err{background:#b71c1c;}
+.note{background:#5d4037;padding:10px;border-radius:5px;margin-bottom:20px;}
 </style></head><body>
-<h1>🔑 Daily Flattrade Login</h1>
+<h1>🔑 Manual Login (Fallback)</h1>
+<div class="note">⚡ <b>Tip:</b> Use <a href="/autologin" style="color:#00d9ff">Auto-Login</a> instead.
+This manual page is only needed if auto-login fails.</div>
 {% if msg %}<div class="msg {{'ok' if success else 'err'}}">{{msg}}</div>{% endif %}
 <div class="step"><b>Step 1:</b><br><br>
 <a class="btn" href="https://auth.flattrade.in/?app_key={{api_key}}" target="_blank">🚀 Login to Flattrade</a>
@@ -496,7 +687,8 @@ input{width:100%;padding:10px;font-size:16px;background:#0f3460;color:white;bord
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
-    msg = None; success = False
+    msg = None
+    success = False
     if request.method == "POST":
         code = request.form.get("request_code", "").strip()
         if code:
@@ -504,6 +696,7 @@ def login():
             msg = "✅ Token generated!" if success else f"❌ {result}"
     return render_template_string(LOGIN_HTML, msg=msg, success=success, api_key=API_KEY)
 
+# All other routes completely unchanged
 SETUP_HTML = """
 <!DOCTYPE html><html><head><title>Strike Setup</title>
 <style>body{font-family:Arial;background:#1a1a2e;color:#eee;padding:30px;max-width:600px;margin:auto;}
@@ -518,7 +711,7 @@ button{background:#e94560;color:white;padding:12px 25px;border:none;border-radiu
 </style></head><body>
 <h1>⚙️ Strike Setup (Optional Fallback)</h1>
 <div class="note">💡 <b>Note:</b> If your TradingView alert already sends the "symbol" field,
-this setup is NOT needed. Use this only for old-style alerts.</div>
+this setup is NOT needed.</div>
 {% if saved %}<div class="ok">✅ Saved!<br>Instrument: {{instrument}}<br>
 CE: {{ce}}<br>PE: {{pe}}<br>Qty: {{qty}}</div>{% endif %}
 <div class="box"><form method="POST">
@@ -542,9 +735,11 @@ CE: {{ce}}<br>PE: {{pe}}<br>Qty: {{qty}}</div>{% endif %}
 @app.route("/setup", methods=["GET", "POST"])
 def setup():
     now_ist = datetime.now(IST)
-    defaults = {"day": now_ist.strftime("%d"), "mon": now_ist.strftime("%b").upper(),
-                "yr": now_ist.strftime("%y"), "ce_strike": "24500",
-                "pe_strike": "", "lots": "1", "instrument": state.get("instrument", "NIFTY")}
+    defaults = {
+        "day": now_ist.strftime("%d"), "mon": now_ist.strftime("%b").upper(),
+        "yr": now_ist.strftime("%y"), "ce_strike": "24500",
+        "pe_strike": "", "lots": "1", "instrument": state.get("instrument", "NIFTY")
+    }
     saved = False
     if request.method == "POST":
         instrument = request.form.get("instrument", "NIFTY").upper()
@@ -615,16 +810,38 @@ def webhook():
 def health():
     market_status = {name: is_market_open_for(name) for name in INSTRUMENTS}
     return jsonify({
-        "status": "running", "dry_run": DRY_RUN,
-        "ce": state["call_symbol"], "pe": state["put_symbol"],
-        "qty": state["qty"], "token_ok": bool(state["token"]),
-        "instruments": {name: {"exchange": cfg["exchange"],
-                               "lot_size": cfg["lot_size"],
-                               "market_open": market_status[name]}
-                        for name, cfg in INSTRUMENTS.items()},
+        "status":          "running",
+        "dry_run":         DRY_RUN,
+        "auto_login":      AUTO_LOGIN_ENABLED,
+        "login_status":    state["login_status"],
+        "last_login_time": state["last_login_time"],
+        "token_ok":        bool(state["token"]),
+        "ce":              state["call_symbol"],
+        "pe":              state["put_symbol"],
+        "qty":             state["qty"],
+        "instruments": {
+            name: {
+                "exchange":    cfg["exchange"],
+                "lot_size":    cfg["lot_size"],
+                "market_open": market_status[name]
+            }
+            for name, cfg in INSTRUMENTS.items()
+        },
         "time_ist": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
     }), 200
 
+# =============================================
+# STARTUP
+# =============================================
 if __name__ == "__main__":
+    # Start the auto-login scheduler in background
+    scheduler_thread = threading.Thread(
+        target=scheduled_auto_login,
+        daemon=True,
+        name="AutoLoginScheduler"
+    )
+    scheduler_thread.start()
+    add_log("[STARTUP] Auto-login scheduler thread started.")
+
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
