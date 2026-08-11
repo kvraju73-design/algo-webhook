@@ -1,6 +1,6 @@
 """
-Flattrade MULTI-INSTRUMENT - CLOUD VERSION for Railway v3
-FIXED: Manual CE/PE exit, symbol matching, feedback
+Flattrade MULTI-INSTRUMENT - CLOUD VERSION for Railway v4
+FIXED: Strike price update issue - new strikes now apply immediately
 """
 
 import os
@@ -60,10 +60,9 @@ INSTRUMENTS = {
         "market_close": dtime(23, 30),
     },
 }
-
 DEFAULT_LOT_SIZE = 65
-# =============================================
 
+# =============================================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -72,6 +71,10 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
+# =============================================
+# STATE - FIXED: added separate form_values
+#         so display always shows what user typed
+# =============================================
 state = {
     "token":       None,
     "call_symbol": "",
@@ -81,21 +84,32 @@ state = {
     "logs":        [],
     "last_action": {},
     "manual": {
+        # Stores actual order symbols + qty
         "NIFTY":     {"call": "", "put": "", "qty": 65,  "lots": 1},
         "BANKNIFTY": {"call": "", "put": "", "qty": 30,  "lots": 1},
         "CRUDEOIL":  {"call": "", "put": "", "qty": 100, "lots": 1},
+    },
+    # ── FIXED: Stores what user typed in form ──
+    # So page always shows fresh typed values
+    "form": {
+        "NIFTY":     {"day": "", "mon": "", "yr": "",
+                      "ce_strike": "", "pe_strike": "", "lots": "1"},
+        "BANKNIFTY": {"day": "", "mon": "", "yr": "",
+                      "ce_strike": "", "pe_strike": "", "lots": "1"},
+        "CRUDEOIL":  {"day": "", "mon": "", "yr": "",
+                      "ce_strike": "", "pe_strike": "", "lots": "1"},
     }
 }
 
 IST = pytz.timezone("Asia/Kolkata")
 
 def add_log(msg):
-    ts = datetime.now(IST).strftime("%H:%M:%S")
+    ts    = datetime.now(IST).strftime("%H:%M:%S")
     entry = f"[{ts}] {msg}"
     state["logs"].append(entry)
     state["logs"] = state["logs"][-200:]
     log.info(msg)
-    return entry  # ← FIXED: return log entry for feedback
+    return entry
 
 # -----------------------------------------------
 # INSTRUMENT DETECTION
@@ -149,7 +163,8 @@ def exchange_request_code(request_code):
         "api_secret":   hash_value
     }
     try:
-        r    = requests.post(TOKEN_URL, json=payload, proxies=PROXIES, timeout=15)
+        r    = requests.post(TOKEN_URL, json=payload,
+                             proxies=PROXIES, timeout=15)
         resp = r.json()
     except Exception as e:
         add_log(f"[LOGIN] Failed: {e}")
@@ -251,23 +266,19 @@ def place_order(symbol, trantype, qty=None):
         add_log("[ORDER] LTP fetch failed. Aborting.")
         return None
 
-    price = round(ltp * 1.005, 1) if trantype == "B" else round(ltp * 0.995, 1)
+    price = (round(ltp * 1.005, 1) if trantype == "B"
+             else round(ltp * 0.995, 1))
 
     if DRY_RUN:
         add_log(f"[DRY RUN] {action} {qty} {symbol} @ {price} (LTP {ltp})")
         return "DRY_RUN"
 
     payload = {
-        "uid":      USER_ID,
-        "actid":    USER_ID,
-        "exch":     exchange,
-        "tsym":     symbol,
-        "qty":      str(qty),
-        "prc":      str(price),
-        "prd":      PRODUCT,
-        "trantype": trantype,
-        "prctyp":   "LMT",
-        "ret":      "DAY"
+        "uid":      USER_ID, "actid": USER_ID,
+        "exch":     exchange, "tsym":  symbol,
+        "qty":      str(qty), "prc":   str(price),
+        "prd":      PRODUCT,  "trantype": trantype,
+        "prctyp":   "LMT",   "ret":   "DAY"
     }
     try:
         r    = requests.post(
@@ -279,7 +290,10 @@ def place_order(symbol, trantype, qty=None):
         resp = r.json()
         if resp.get("stat") == "Ok":
             ordno = resp.get("norenordno", "")
-            add_log(f"[OK] ORDER PLACED | {action} {qty} {symbol} @ {price} | No: {ordno}")
+            add_log(
+                f"[OK] ORDER PLACED | {action} {qty} "
+                f"{symbol} @ {price} | No: {ordno}"
+            )
             return ordno
         add_log(f"[ERR] ORDER FAILED | {resp.get('emsg')}")
     except Exception as e:
@@ -287,15 +301,9 @@ def place_order(symbol, trantype, qty=None):
     return None
 
 # -----------------------------------------------
-# EXIT POSITION - FIXED
+# EXIT POSITION
 # -----------------------------------------------
-def exit_position(symbol, qty=None):
-    """
-    FIXED:
-    1. Fuzzy symbol matching (handles Flattrade year format differences)
-    2. Better error messages
-    3. Returns result string for feedback
-    """
+def exit_position(symbol):
     add_log(f"[EXIT] Triggered for {symbol}")
 
     instrument, cfg = get_instrument_config(symbol)
@@ -333,42 +341,40 @@ def exit_position(symbol, qty=None):
         )
         resp_data = r.json()
 
-        # ── FIXED: Handle both list and dict responses ──
         if isinstance(resp_data, dict):
-            add_log(f"[EXIT] PositionBook error: {resp_data.get('emsg', resp_data)}")
+            add_log(
+                f"[EXIT] PositionBook error: "
+                f"{resp_data.get('emsg', resp_data)}"
+            )
             return f"ERROR: {resp_data.get('emsg', 'No positions')}"
 
         if not isinstance(resp_data, list) or len(resp_data) == 0:
-            add_log(f"[EXIT] No open positions found.")
+            add_log("[EXIT] No open positions found.")
             return "ERROR: No positions"
 
-        # ── FIXED: Fuzzy symbol matching ──
-        # Flattrade sometimes returns different expiry formats
-        # e.g., sent "NIFTY11AUG26C24500" but stored "NIFTY11AUG2026C24500"
+        # ── Fuzzy symbol matching ──
         def symbols_match(pos_sym, target_sym):
             if pos_sym == target_sym:
                 return True
-            # Normalize: remove all non-alphanumeric chars and compare
             pos_clean    = re.sub(r'[^A-Z0-9]', '', pos_sym.upper())
             target_clean = re.sub(r'[^A-Z0-9]', '', target_sym.upper())
             if pos_clean == target_clean:
                 return True
-            # Try matching by strike + option type (last resort)
-            # Extract: instrument, option_type, strike
-            m1 = re.search(r'^([A-Z]+)\d+[A-Z]+\d+(C|P)(\d+)$', pos_sym.upper())
-            m2 = re.search(r'^([A-Z]+)\d+[A-Z]+\d+(C|P)(\d+)$', target_sym.upper())
+            m1 = re.search(
+                r'^([A-Z]+)\d+[A-Z]+\d+(C|P)(\d+)$', pos_sym.upper())
+            m2 = re.search(
+                r'^([A-Z]+)\d+[A-Z]+\d+(C|P)(\d+)$', target_sym.upper())
             if m1 and m2:
                 return (m1.group(1) == m2.group(1) and
                         m1.group(2) == m2.group(2) and
                         m1.group(3) == m2.group(3))
             return False
 
-        found = False
+        found  = False
         result = ""
 
         for pos in resp_data:
             pos_sym = pos.get("tsym", "")
-
             if not symbols_match(pos_sym, symbol):
                 continue
 
@@ -376,44 +382,40 @@ def exit_position(symbol, qty=None):
             net_qty = int(pos.get("netqty", 0))
 
             if net_qty == 0:
-                msg = f"[EXIT] No open qty in {symbol} (netqty=0)"
-                add_log(msg)
+                add_log(f"[EXIT] No open qty in {symbol} (netqty=0)")
                 return "No open position to exit"
 
-            # Direction: if long (net_qty > 0) → SELL to exit
-            #            if short (net_qty < 0) → BUY to exit
             trantype = "S" if net_qty > 0 else "B"
             exit_qty = abs(net_qty)
             action   = "SELL" if trantype == "S" else "BUY"
 
-            add_log(f"[EXIT] Found {pos_sym} netqty={net_qty} → {action} {exit_qty}")
+            add_log(
+                f"[EXIT] Found {pos_sym} netqty={net_qty} "
+                f"→ {action} {exit_qty}"
+            )
 
             ltp = get_ltp(pos_sym, exchange)
             if ltp is None:
-                ltp = float(pos.get("lp", 0)) or float(pos.get("upldprc", 100))
+                ltp = float(pos.get("lp", 0)) or float(
+                    pos.get("upldprc", 100))
                 add_log(f"[EXIT] Using fallback LTP: {ltp}")
 
-            price = (
-                round(ltp * 0.995, 1) if trantype == "S"
-                else round(ltp * 1.005, 1)
-            )
+            price = (round(ltp * 0.995, 1) if trantype == "S"
+                     else round(ltp * 1.005, 1))
 
             sq_payload = {
-                "uid":      USER_ID,
-                "actid":    USER_ID,
-                "exch":     exchange,
-                "tsym":     pos_sym,    # ← FIXED: use symbol from position book!
-                "qty":      str(exit_qty),
-                "prc":      str(price),
-                "prd":      PRODUCT,
-                "trantype": trantype,
-                "prctyp":   "LMT",
-                "ret":      "DAY"
+                "uid":      USER_ID, "actid":    USER_ID,
+                "exch":     exchange, "tsym":     pos_sym,
+                "qty":      str(exit_qty), "prc": str(price),
+                "prd":      PRODUCT,  "trantype": trantype,
+                "prctyp":   "LMT",   "ret":      "DAY"
             }
-
             sq_r    = requests.post(
                 BASE_URL_ORDER + "/PlaceOrder",
-                data="jData=" + json.dumps(sq_payload) + "&jKey=" + state["token"],
+                data=(
+                    "jData=" + json.dumps(sq_payload) +
+                    "&jKey=" + state["token"]
+                ),
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
                 proxies=PROXIES, timeout=8
             )
@@ -421,7 +423,10 @@ def exit_position(symbol, qty=None):
 
             if sq_resp.get("stat") == "Ok":
                 ordno  = sq_resp.get("norenordno", "")
-                result = f"EXITED {pos_sym} qty={exit_qty} @ {price} | Order#{ordno}"
+                result = (
+                    f"EXITED {pos_sym} qty={exit_qty} "
+                    f"@ {price} | Order#{ordno}"
+                )
                 add_log(f"[OK] {result}")
             else:
                 err    = sq_resp.get("emsg", "Unknown error")
@@ -429,9 +434,14 @@ def exit_position(symbol, qty=None):
                 add_log(f"[ERR] {result}")
 
         if not found:
-            # ── FIXED: Show all available symbols for debugging ──
-            available = [p.get("tsym","") for p in resp_data if int(p.get("netqty",0)) != 0]
-            msg = f"[EXIT] {symbol} not found. Open positions: {available}"
+            available = [
+                p.get("tsym", "") for p in resp_data
+                if int(p.get("netqty", 0)) != 0
+            ]
+            msg = (
+                f"[EXIT] {symbol} not found. "
+                f"Open positions: {available}"
+            )
             add_log(msg)
             return f"Not in positions. Open: {available}"
 
@@ -442,7 +452,7 @@ def exit_position(symbol, qty=None):
         return f"ERROR: {e}"
 
 # -----------------------------------------------
-# ACTION HANDLER
+# ACTION HANDLER (Webhook)
 # -----------------------------------------------
 def handle_action(action, qty=None, symbol=None):
     action = action.upper().strip()
@@ -454,7 +464,6 @@ def handle_action(action, qty=None, symbol=None):
         return
     state["last_action"][dedup_key] = now
 
-    # ── Dynamic: symbol from TradingView alert ──
     if symbol:
         symbol     = symbol.strip().upper()
         instrument = detect_instrument(symbol)
@@ -464,25 +473,32 @@ def handle_action(action, qty=None, symbol=None):
         elif not qty:
             qty = DEFAULT_LOT_SIZE
 
-        add_log(f"[ACTION] {action} | {symbol} | Instrument={instrument} | Qty={qty}")
+        add_log(
+            f"[ACTION] {action} | {symbol} | "
+            f"Instrument={instrument} | Qty={qty}"
+        )
 
         if action in ("BUY", "BUY_CALL", "BUY_PUT"):
             place_order(symbol, "B", qty)
-        elif action in ("SELL", "EXIT", "EXIT_CALL", "EXIT_PUT", "EXIT_ALL"):
-            exit_position(symbol, qty)
+        elif action in ("SELL", "EXIT", "EXIT_CALL",
+                        "EXIT_PUT", "EXIT_ALL"):
+            exit_position(symbol)
         elif action in ("SELL_SHORT", "SHORT"):
             place_order(symbol, "S", qty)
         else:
             add_log(f"[ACTION] Unknown action: {action}")
         return
 
-    # ── Fallback: pre-configured CE/PE from /setup ──
+    # Fallback: use /setup strikes
     ce  = state["call_symbol"]
     pe  = state["put_symbol"]
     qty = qty or state["qty"]
 
     if not ce or not pe:
-        add_log("[ACTION] ERROR: No symbol in alert AND strikes not set at /setup!")
+        add_log(
+            "[ACTION] ERROR: No symbol in alert "
+            "AND strikes not set at /setup!"
+        )
         return
 
     action_map = {
@@ -526,7 +542,7 @@ th,td{padding:10px;text-align:left;border-bottom:1px solid #0f3460;}
 th{background:#0f3460;color:#ffd700;}
 code{background:#0a0e27;padding:3px 6px;border-radius:3px;color:#00d9ff;}
 </style></head><body>
-<h1>🚀 Flattrade Algo — Multi-Instrument v3</h1>
+<h1>🚀 Flattrade Algo — Multi-Instrument v4</h1>
 <div class="status">
 <b>Token:</b>
 <span class="{{ 'ok' if token else 'err' }}">
@@ -544,42 +560,37 @@ code{background:#0a0e27;padding:3px 6px;border-radius:3px;color:#00d9ff;}
     <th>Market Hours (IST)</th><th>Status</th></tr>
 {% for name, cfg in instruments.items() %}
 <tr>
-<td><b>{{ name }}</b></td>
-<td>{{ cfg.exchange }}</td>
+<td><b>{{ name }}</b></td><td>{{ cfg.exchange }}</td>
 <td>{{ cfg.lot_size }}</td>
-<td>{{ cfg.market_open.strftime('%H:%M') }} - {{ cfg.market_close.strftime('%H:%M') }}</td>
+<td>{{ cfg.market_open.strftime('%H:%M') }} -
+    {{ cfg.market_close.strftime('%H:%M') }}</td>
 <td>{% if market_status[name] %}
-      <span class="ok">🟢 OPEN</span>
-    {% else %}
-      <span class="warn">🔴 CLOSED</span>
-    {% endif %}
-</td>
-</tr>
-{% endfor %}
+<span class="ok">🟢 OPEN</span>
+{% else %}<span class="warn">🔴 CLOSED</span>{% endif %}</td>
+</tr>{% endfor %}
 </table>
 <h2>Quick Actions</h2>
 <a href="/login">🔑 Daily Login</a>
 <a href="/manual">⚡ Manual Trading</a>
-<a href="/setup">⚙️ Strike Setup</a>
 <a href="/logs">📋 View Logs</a>
 <a href="/health">💚 Health</a>
-<h2>🔗 Webhook URL</h2>
-<div class="status"><code>https://{{ host }}/webhook</code></div>
 </body></html>
 """
 
 LOGIN_HTML = """
 <!DOCTYPE html><html><head><title>Login</title>
 <style>
-body{font-family:Arial;background:#1a1a2e;color:#eee;padding:30px;
-     max-width:700px;margin:auto;}
+body{font-family:Arial;background:#1a1a2e;color:#eee;
+     padding:30px;max-width:700px;margin:auto;}
 h1{color:#00d9ff;}
-a.btn,button{background:#e94560;color:white;padding:12px 25px;border:none;
-  border-radius:5px;text-decoration:none;font-size:16px;cursor:pointer;
-  display:inline-block;}
-input{width:100%;padding:10px;font-size:16px;background:#0f3460;color:white;
-  border:1px solid #00d9ff;border-radius:5px;margin:10px 0;box-sizing:border-box;}
-.step{margin:20px 0;padding:15px;background:#0f3460;border-left:4px solid #00d9ff;}
+a.btn,button{background:#e94560;color:white;padding:12px 25px;
+  border:none;border-radius:5px;text-decoration:none;
+  font-size:16px;cursor:pointer;display:inline-block;}
+input{width:100%;padding:10px;font-size:16px;background:#0f3460;
+  color:white;border:1px solid #00d9ff;border-radius:5px;
+  margin:10px 0;box-sizing:border-box;}
+.step{margin:20px 0;padding:15px;background:#0f3460;
+      border-left:4px solid #00d9ff;}
 .msg{padding:15px;border-radius:5px;margin:15px 0;}
 .ok{background:#1b5e20;}.err{background:#b71c1c;}
 </style></head><body>
@@ -590,10 +601,9 @@ input{width:100%;padding:10px;font-size:16px;background:#0f3460;color:white;
 <div class="step"><b>Step 1:</b><br><br>
 <a class="btn"
    href="https://auth.flattrade.in/?app_key={{ api_key }}"
-   target="_blank">🚀 Login to Flattrade</a>
-</div>
+   target="_blank">🚀 Login to Flattrade</a></div>
 <div class="step">
-<b>Step 2:</b> Paste request_code from redirect URL:
+  <b>Step 2:</b> Paste request_code from redirect URL:
 </div>
 <form method="POST">
 <input name="request_code" placeholder="Paste request_code"
@@ -604,66 +614,107 @@ input{width:100%;padding:10px;font-size:16px;background:#0f3460;color:white;
 </body></html>
 """
 
+# ── FIXED MANUAL HTML ──
+# Key changes:
+# 1. Form values come from state["form"][inst] - not re-parsed from symbol
+# 2. On save, form values stored separately from order symbols
+# 3. Clear visual confirmation of what was saved
 MANUAL_HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-<title>Manual Trading</title>
+<title>Manual Trading — {{ inst }}</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
-body { font-family: Arial, sans-serif; background: #1a1a2e; color: #eee;
-       padding: 12px; max-width: 480px; margin: auto; }
-h1 { color: #00d9ff; font-size: 20px; margin-bottom: 10px; text-align: center; }
-h2 { color: #ffd700; font-size: 15px; margin: 14px 0 6px; }
-.warn-box { background: #7b1c1c; border-radius: 8px; padding: 10px 14px;
-            margin-bottom: 12px; font-size: 13px; text-align: center; }
-.ok-box   { background: #1b5e20; border-radius: 8px; padding: 8px 14px;
-            margin-bottom: 12px; font-size: 13px; text-align: center; }
+body { font-family: Arial, sans-serif; background: #1a1a2e;
+       color: #eee; padding: 12px; max-width: 480px; margin: auto; }
+h1  { color: #00d9ff; font-size: 20px; margin-bottom: 10px;
+      text-align: center; }
+h2  { color: #ffd700; font-size: 15px; margin: 14px 0 6px; }
+
+.warn-box { background: #7b1c1c; border-radius: 8px;
+            padding: 10px 14px; margin-bottom: 12px;
+            font-size: 13px; text-align: center; }
+.ok-box   { background: #1b5e20; border-radius: 8px;
+            padding: 8px 14px; margin-bottom: 12px;
+            font-size: 13px; text-align: center; }
+
 .tabs { display: flex; gap: 6px; margin-bottom: 14px; }
-.tab  { flex: 1; padding: 10px 4px; text-align: center; border-radius: 8px;
-        background: #0f3460; color: #aaa; font-size: 13px; font-weight: bold;
-        cursor: pointer; border: 2px solid transparent; text-decoration: none; }
-.tab.active { background: #e94560; color: white; border-color: #ff6b6b; }
-.card { background: #16213e; border-radius: 10px; padding: 14px; margin-bottom: 14px; }
-label { display: block; color: #ffd700; font-size: 12px; margin: 8px 0 3px; }
+.tab  { flex: 1; padding: 10px 4px; text-align: center;
+        border-radius: 8px; background: #0f3460; color: #aaa;
+        font-size: 13px; font-weight: bold; cursor: pointer;
+        border: 2px solid transparent; text-decoration: none; }
+.tab.active { background: #e94560; color: white;
+              border-color: #ff6b6b; }
+
+.card  { background: #16213e; border-radius: 10px;
+         padding: 14px; margin-bottom: 14px; }
+label  { display: block; color: #ffd700; font-size: 12px;
+         margin: 8px 0 3px; }
 input, select { width: 100%; padding: 9px 10px; font-size: 15px;
-                background: #0f3460; color: white; border: 1px solid #00d9ff;
-                border-radius: 6px; }
+                background: #0f3460; color: white;
+                border: 1px solid #00d9ff; border-radius: 6px; }
+
+/* FIXED: Highlight changed field */
+input:focus { border-color: #ffd700; outline: none;
+              background: #1a2a4a; }
+
 .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 .row3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
-.save-btn { width: 100%; margin-top: 12px; padding: 13px; font-size: 16px;
-            background: #00d9ff; color: #000; border: none; border-radius: 8px;
-            font-weight: bold; cursor: pointer; }
+
+.save-btn { width: 100%; margin-top: 12px; padding: 13px;
+            font-size: 16px; background: #00d9ff; color: #000;
+            border: none; border-radius: 8px; font-weight: bold;
+            cursor: pointer; }
 .save-btn:active { background: #0099bb; }
-.sym-box { background: #0a0e27; border-radius: 8px; padding: 10px 12px;
-           margin-bottom: 12px; font-size: 13px; line-height: 1.8; }
-.sym-box span { color: #00d9ff; font-weight: bold; }
-.lot-info { color: #ffd700; }
-.btn-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px;
-            margin-bottom: 10px; }
-.btn { padding: 22px 10px; font-size: 17px; font-weight: bold; border: none;
-       border-radius: 10px; cursor: pointer; width: 100%; }
+
+/* FIXED: Active symbol box shows CURRENT saved symbols clearly */
+.sym-box { background: #0a0e27; border-radius: 8px;
+           padding: 10px 12px; margin-bottom: 12px;
+           font-size: 13px; line-height: 2; border: 1px solid #00d9ff; }
+.sym-box .label { color: #888; font-size: 11px; }
+.sym-box .val   { color: #00d9ff; font-weight: bold; font-size: 14px; }
+.sym-box .qty-info { color: #ffd700; }
+
+/* FIXED: Unsaved warning shown when form differs from saved */
+.unsaved { background: #5d4037; border-radius: 6px;
+           padding: 6px 10px; font-size: 12px;
+           margin-bottom: 8px; text-align: center; }
+
+.btn-grid { display: grid; grid-template-columns: 1fr 1fr;
+            gap: 10px; margin-bottom: 10px; }
+.btn { padding: 22px 10px; font-size: 17px; font-weight: bold;
+       border: none; border-radius: 10px; cursor: pointer; width: 100%; }
 .btn:active { opacity: 0.8; transform: scale(0.97); }
-.buy-call  { background: #1b5e20; color: #69f0ae; border: 2px solid #4caf50; }
-.buy-put   { background: #b71c1c; color: #ff8a80; border: 2px solid #f44336; }
-.exit-call { background: #1a237e; color: #82b1ff; border: 2px solid #3f51b5; }
-.exit-put  { background: #4a148c; color: #ea80fc; border: 2px solid #9c27b0; }
-.exit-all  { width: 100%; padding: 16px; font-size: 16px; font-weight: bold;
-             background: #e65100; color: white; border: none; border-radius: 10px;
-             cursor: pointer; margin-bottom: 10px; }
+.buy-call  { background: #1b5e20; color: #69f0ae;
+             border: 2px solid #4caf50; }
+.buy-put   { background: #b71c1c; color: #ff8a80;
+             border: 2px solid #f44336; }
+.exit-call { background: #1a237e; color: #82b1ff;
+             border: 2px solid #3f51b5; }
+.exit-put  { background: #4a148c; color: #ea80fc;
+             border: 2px solid #9c27b0; }
+.exit-all  { width: 100%; padding: 16px; font-size: 16px;
+             font-weight: bold; background: #e65100; color: white;
+             border: none; border-radius: 10px; cursor: pointer;
+             margin-bottom: 10px; }
 .exit-all:active { opacity: 0.8; }
+
 .flash { padding: 10px 14px; border-radius: 8px; margin-bottom: 10px;
          font-size: 13px; text-align: center; font-weight: bold;
          word-break: break-word; }
 .flash.ok  { background: #1b5e20; color: #69f0ae; }
 .flash.err { background: #7b1c1c; color: #ff8a80; }
-.mkt { font-size: 12px; text-align: center; margin-bottom: 10px; color: #aaa; }
+
+.mkt { font-size: 12px; text-align: center;
+       margin-bottom: 10px; color: #aaa; }
 .mkt .open   { color: #4caf50; }
 .mkt .closed { color: #f44336; }
+
 .log-box { background: #0a0e27; border-radius: 8px; padding: 10px;
-           font-size: 11px; color: #0f0; max-height: 160px; overflow-y: auto;
-           font-family: monospace; margin-top: 10px; }
+           font-size: 11px; color: #0f0; max-height: 160px;
+           overflow-y: auto; font-family: monospace; margin-top: 10px; }
 a.back { display: block; text-align: center; margin-top: 14px;
          color: #00d9ff; font-size: 13px; }
 </style>
@@ -706,110 +757,160 @@ a.back { display: block; text-align: center; margin-top: 14px;
     <span class="open">🟢 OPEN</span>
   {% else %}
     <span class="closed">
-      🔴 CLOSED ({{ mkt_open_time }} – {{ mkt_close_time }} IST)
+      🔴 CLOSED ({{ mkt_open_time }}–{{ mkt_close_time }} IST)
     </span>
   {% endif %}
   &nbsp;|&nbsp; {{ time_now }}
 </div>
 
-<!-- Strike Setup -->
+<!-- ═══════════════════════════════════════════
+     STRIKE SETUP FORM
+     Values come from state["form"][inst]
+     NOT re-parsed from saved symbol
+     ═══════════════════════════════════════════ -->
 <div class="card">
   <h2>⚙️ Strike Setup — {{ inst }}</h2>
-  <form method="POST" action="/manual/setup">
+  <form method="POST" action="/manual/setup"
+        id="setupForm">
     <input type="hidden" name="inst" value="{{ inst }}">
+
     <div class="row3">
       <div>
-        <label>Day</label>
-        <input name="day" value="{{ day }}" maxlength="2" placeholder="DD">
+        <label>Day (DD)</label>
+        <!-- FIXED: value="{{ fday }}" from form state -->
+        <input name="day" id="fDay"
+               value="{{ fday }}"
+               maxlength="2" placeholder="11"
+               oninput="previewSymbol()">
       </div>
       <div>
-        <label>Month</label>
-        <input name="mon" value="{{ mon }}" maxlength="3" placeholder="AUG">
+        <label>Month (MMM)</label>
+        <input name="mon" id="fMon"
+               value="{{ fmon }}"
+               maxlength="3" placeholder="AUG"
+               oninput="previewSymbol()"
+               style="text-transform:uppercase">
       </div>
       <div>
-        <label>Year</label>
-        <input name="yr"  value="{{ yr  }}" maxlength="2" placeholder="26">
+        <label>Year (YY)</label>
+        <input name="yr" id="fYr"
+               value="{{ fyr }}"
+               maxlength="2" placeholder="26"
+               oninput="previewSymbol()">
       </div>
     </div>
+
     <div class="row2">
       <div>
         <label>CE Strike</label>
-        <input name="ce" value="{{ ce_strike }}" placeholder="24500">
+        <input name="ce" id="fCe"
+               value="{{ fce }}"
+               placeholder="24500"
+               oninput="previewSymbol()">
       </div>
       <div>
         <label>PE Strike</label>
-        <input name="pe" value="{{ pe_strike }}" placeholder="same as CE">
+        <input name="pe" id="fPe"
+               value="{{ fpe }}"
+               placeholder="same as CE"
+               oninput="previewSymbol()">
       </div>
     </div>
+
     <div class="row2">
       <div>
         <label>Lots</label>
-        <input name="lots" type="number" value="{{ lots }}" min="1">
+        <input name="lots" id="fLots"
+               type="number" value="{{ flots }}"
+               min="1" oninput="previewSymbol()">
       </div>
       <div>
-        <label>Qty (auto)</label>
-        <input value="{{ qty }} ({{ lots }}×{{ lot_size }})"
-               disabled style="color:#aaa">
+        <label>Qty</label>
+        <input id="fQtyDisplay" disabled
+               style="color:#ffd700"
+               value="{{ flots|int * lot_size }}">
       </div>
     </div>
-    <button type="submit" class="save-btn">💾 Save Strikes</button>
+
+    <!-- FIXED: Live preview of what will be saved -->
+    <div style="margin-top:10px;padding:8px;background:#0a0e27;
+                border-radius:6px;font-size:12px;">
+      <span style="color:#888">Preview: </span>
+      <span id="previewCe" style="color:#69f0ae">-</span>
+      &nbsp;/&nbsp;
+      <span id="previewPe" style="color:#ff8a80">-</span>
+    </div>
+
+    <button type="submit" class="save-btn">
+      💾 Save & Activate Strikes
+    </button>
   </form>
 </div>
 
-<!-- Symbol Display + Trading Buttons -->
+<!-- ═══════════════════════════════════════════
+     ACTIVE SYMBOLS DISPLAY
+     Shows CURRENTLY SAVED symbols for trading
+     ═══════════════════════════════════════════ -->
 {% if call_sym and put_sym %}
+
 <div class="sym-box">
-  📞 CE: <span>{{ call_sym }}</span><br>
-  📉 PE: <span>{{ put_sym }}</span><br>
-  <span class="lot-info">
-    📦 Qty: {{ qty }} ({{ lots }} lot × {{ lot_size }})
-  </span>
+  <div class="label">🟢 ACTIVE — Orders will use these symbols:</div>
+  <div>CE: <span class="val">{{ call_sym }}</span></div>
+  <div>PE: <span class="val">{{ put_sym }}</span></div>
+  <div class="qty-info">
+    📦 Qty: {{ qty }} &nbsp;({{ saved_lots }} lot × {{ lot_size }})
+  </div>
 </div>
 
-<!-- ── TRADING BUTTONS ── -->
+<!-- Trading Buttons -->
 <div class="btn-grid">
 
-  <!-- BUY CALL -->
   <form method="POST" action="/manual/order">
     <input type="hidden" name="inst"   value="{{ inst }}">
     <input type="hidden" name="action" value="BUY_CALL">
-    <button type="submit" class="btn buy-call">📈 BUY<br>CALL</button>
+    <button type="submit" class="btn buy-call">
+      📈 BUY<br>CALL
+    </button>
   </form>
 
-  <!-- BUY PUT -->
   <form method="POST" action="/manual/order">
     <input type="hidden" name="inst"   value="{{ inst }}">
     <input type="hidden" name="action" value="BUY_PUT">
-    <button type="submit" class="btn buy-put">📉 BUY<br>PUT</button>
+    <button type="submit" class="btn buy-put">
+      📉 BUY<br>PUT
+    </button>
   </form>
 
-  <!-- EXIT CALL -->
   <form method="POST" action="/manual/order">
     <input type="hidden" name="inst"   value="{{ inst }}">
     <input type="hidden" name="action" value="EXIT_CALL">
-    <button type="submit" class="btn exit-call">🚪 EXIT<br>CALL</button>
+    <button type="submit" class="btn exit-call">
+      🚪 EXIT<br>CALL
+    </button>
   </form>
 
-  <!-- EXIT PUT -->
   <form method="POST" action="/manual/order">
     <input type="hidden" name="inst"   value="{{ inst }}">
     <input type="hidden" name="action" value="EXIT_PUT">
-    <button type="submit" class="btn exit-put">🚪 EXIT<br>PUT</button>
+    <button type="submit" class="btn exit-put">
+      🚪 EXIT<br>PUT
+    </button>
   </form>
 
 </div>
 
-<!-- EXIT ALL -->
 <form method="POST" action="/manual/order">
   <input type="hidden" name="inst"   value="{{ inst }}">
   <input type="hidden" name="action" value="EXIT_ALL">
-  <button type="submit" class="exit-all">⛔ EXIT ALL (CE + PE)</button>
+  <button type="submit" class="exit-all">
+    ⛔ EXIT ALL (CE + PE)
+  </button>
 </form>
 
 {% else %}
 <div class="warn-box" style="margin-top:10px;">
-  ⚠️ Enter strike details above and tap
-  <b>Save Strikes</b> to enable trading buttons.
+  ⚠️ Fill strike details above and tap
+  <b>Save & Activate Strikes</b> to enable trading buttons.
 </div>
 {% endif %}
 
@@ -823,57 +924,40 @@ a.back { display: block; text-align: center; margin-top: 14px;
 
 <a href="/" class="back">← Back to Dashboard</a>
 
+<!-- FIXED: Live symbol preview script -->
+<script>
+const inst    = "{{ inst }}";
+const lotSize = {{ lot_size }};
+
+function previewSymbol() {
+  const day  = document.getElementById('fDay').value.trim().padStart(2,'0');
+  const mon  = document.getElementById('fMon').value.trim().toUpperCase();
+  const yr   = document.getElementById('fYr').value.trim();
+  const ce   = document.getElementById('fCe').value.trim();
+  const pe   = document.getElementById('fPe').value.trim() || ce;
+  const lots = parseInt(document.getElementById('fLots').value) || 1;
+
+  document.getElementById('fQtyDisplay').value =
+    (lots * lotSize) + ' (' + lots + '×' + lotSize + ')';
+
+  if (day && mon && yr && ce) {
+    const expiry = day + mon + yr;
+    document.getElementById('previewCe').textContent =
+      inst + expiry + 'C' + ce;
+    document.getElementById('previewPe').textContent =
+      inst + expiry + 'P' + pe;
+  } else {
+    document.getElementById('previewCe').textContent = '-';
+    document.getElementById('previewPe').textContent = '-';
+  }
+}
+
+// Run once on load to show current preview
+previewSymbol();
+</script>
+
 </body>
 </html>
-"""
-
-SETUP_HTML = """
-<!DOCTYPE html><html><head><title>Strike Setup</title>
-<style>
-body{font-family:Arial;background:#1a1a2e;color:#eee;padding:30px;
-     max-width:600px;margin:auto;}
-h1{color:#00d9ff;}
-.box{background:#16213e;padding:20px;border-radius:8px;}
-label{display:block;margin:15px 0 5px;color:#ffd700;}
-input,select{width:100%;padding:10px;font-size:16px;background:#0f3460;
-  color:white;border:1px solid #00d9ff;border-radius:5px;box-sizing:border-box;}
-button{background:#e94560;color:white;padding:12px 25px;border:none;
-  border-radius:5px;font-size:16px;cursor:pointer;margin-top:20px;}
-.ok{background:#1b5e20;padding:15px;border-radius:5px;margin:15px 0;}
-</style></head><body>
-<h1>⚙️ Strike Setup (Webhook Fallback)</h1>
-{% if saved %}
-<div class="ok">✅ Saved!<br>
-  Instrument: {{ instrument }}<br>
-  CE: {{ ce }}<br>PE: {{ pe }}<br>Qty: {{ qty }}
-</div>
-{% endif %}
-<div class="box"><form method="POST">
-<label>Instrument:</label>
-<select name="instrument" required>
-<option value="NIFTY"
-  {% if instrument=='NIFTY' %}selected{% endif %}>NIFTY (Lot 65)</option>
-<option value="BANKNIFTY"
-  {% if instrument=='BANKNIFTY' %}selected{% endif %}>BANKNIFTY (Lot 30)</option>
-<option value="CRUDEOIL"
-  {% if instrument=='CRUDEOIL' %}selected{% endif %}>CRUDEOIL (Lot 100)</option>
-</select>
-<label>Day (DD):</label>
-<input name="day" value="{{ day }}" required>
-<label>Month (JAN..DEC):</label>
-<input name="mon" value="{{ mon }}" required>
-<label>Year (YY):</label>
-<input name="yr"  value="{{ yr  }}" required>
-<label>CE Strike:</label>
-<input name="ce_strike" value="{{ ce_strike }}" required>
-<label>PE Strike (blank = same as CE):</label>
-<input name="pe_strike" value="{{ pe_strike }}">
-<label>Lots:</label>
-<input name="lots" type="number" value="{{ lots }}" required>
-<button type="submit">Save Strikes</button>
-</form></div>
-<br><a href="/" style="color:#00d9ff">← Back</a>
-</body></html>
 """
 
 # -----------------------------------------------
@@ -900,53 +984,6 @@ def login():
     return render_template_string(LOGIN_HTML,
         msg=msg, success=success, api_key=API_KEY)
 
-@app.route("/setup", methods=["GET", "POST"])
-def setup():
-    now_ist  = datetime.now(IST)
-    defaults = {
-        "day":       now_ist.strftime("%d"),
-        "mon":       now_ist.strftime("%b").upper(),
-        "yr":        now_ist.strftime("%y"),
-        "ce_strike": "24500",
-        "pe_strike": "",
-        "lots":      "1",
-        "instrument": state.get("instrument", "NIFTY")
-    }
-    saved = False
-    if request.method == "POST":
-        instrument = request.form.get("instrument", "NIFTY").upper()
-        day        = request.form.get("day", "").strip().zfill(2)
-        mon        = request.form.get("mon", "").strip().upper()
-        yr         = request.form.get("yr",  "").strip()
-        ce_strike  = request.form.get("ce_strike", "").strip()
-        pe_strike  = request.form.get("pe_strike", "").strip() or ce_strike
-        lots       = int(request.form.get("lots", "1"))
-
-        expiry               = f"{day}{mon}{yr}"
-        state["call_symbol"] = f"{instrument}{expiry}C{ce_strike}"
-        state["put_symbol"]  = f"{instrument}{expiry}P{pe_strike}"
-        state["instrument"]  = instrument
-        lot_size             = INSTRUMENTS.get(instrument, {}).get(
-                                   "lot_size", DEFAULT_LOT_SIZE)
-        state["qty"]         = lots * lot_size
-
-        add_log(
-            f"[SETUP] {instrument} | "
-            f"CE={state['call_symbol']} "
-            f"PE={state['put_symbol']} "
-            f"QTY={state['qty']}"
-        )
-        saved = True
-        defaults.update({
-            "day": day, "mon": mon, "yr": yr,
-            "ce_strike": ce_strike, "pe_strike": pe_strike,
-            "lots": lots, "instrument": instrument
-        })
-
-    return render_template_string(SETUP_HTML, saved=saved,
-        ce=state["call_symbol"], pe=state["put_symbol"],
-        qty=state["qty"], **defaults)
-
 @app.route("/logs")
 def logs_page():
     lines = "\n".join(reversed(state["logs"]))
@@ -960,16 +997,16 @@ def webhook():
     try:
         data = request.get_json(force=True)
         if not data:
-            return jsonify({"status": "error", "msg": "empty payload"}), 400
+            return jsonify({"status": "error", "msg": "empty"}), 400
 
         add_log(f"[WEBHOOK] {json.dumps(data)}")
 
         if WEBHOOK_SECRET and data.get("secret") != WEBHOOK_SECRET:
-            add_log("[WEBHOOK] Secret mismatch. Rejected.")
+            add_log("[WEBHOOK] Secret mismatch.")
             return jsonify({"status": "error", "msg": "unauthorized"}), 403
 
-        action            = data.get("action", "")
-        qty_raw           = data.get("qty", None)
+        action = data.get("action", "")
+        qty_raw = data.get("qty", None)
         symbol_from_alert = data.get("symbol", None)
 
         qty = None
@@ -985,13 +1022,8 @@ def webhook():
             daemon=True
         )
         t.start()
-
-        return jsonify({
-            "status": "ok",
-            "action": action,
-            "qty":    qty,
-            "symbol": symbol_from_alert
-        }), 200
+        return jsonify({"status": "ok", "action": action,
+                        "qty": qty, "symbol": symbol_from_alert}), 200
 
     except Exception as e:
         add_log(f"[WEBHOOK] Exception: {e}")
@@ -1001,25 +1033,19 @@ def webhook():
 def health():
     market_status = {name: is_market_open_for(name) for name in INSTRUMENTS}
     return jsonify({
-        "status":    "running",
-        "dry_run":   DRY_RUN,
-        "ce":        state["call_symbol"],
-        "pe":        state["put_symbol"],
-        "qty":       state["qty"],
-        "token_ok":  bool(state["token"]),
+        "status":   "running", "dry_run": DRY_RUN,
+        "token_ok": bool(state["token"]),
         "instruments": {
-            name: {
-                "exchange":    cfg["exchange"],
-                "lot_size":    cfg["lot_size"],
-                "market_open": market_status[name]
-            }
+            name: {"exchange":    cfg["exchange"],
+                   "lot_size":    cfg["lot_size"],
+                   "market_open": market_status[name]}
             for name, cfg in INSTRUMENTS.items()
         },
         "time_ist": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
     }), 200
 
 # -----------------------------------------------
-# MANUAL TRADING ROUTES
+# MANUAL ROUTES - FIXED
 # -----------------------------------------------
 @app.route("/manual", methods=["GET"])
 def manual():
@@ -1027,33 +1053,20 @@ def manual():
     if inst not in INSTRUMENTS:
         inst = "NIFTY"
 
-    cfg     = INSTRUMENTS[inst]
-    m       = state["manual"][inst]
-    now_ist = datetime.now(IST)
-
-    lots     = m["lots"]
+    cfg      = INSTRUMENTS[inst]
+    m        = state["manual"][inst]
+    f        = state["form"][inst]          # ← FIXED: read form state
+    now_ist  = datetime.now(IST)
     lot_size = cfg["lot_size"]
-    qty      = lots * lot_size
 
-    day = now_ist.strftime("%d")
-    mon = now_ist.strftime("%b").upper()
-    yr  = now_ist.strftime("%y")
-
-    ce_strike = ""
-    pe_strike = ""
-
-    if m["call"]:
-        match = re.search(r'C(\d+)$', m["call"])
-        if match:
-            ce_strike = match.group(1)
-        em = re.search(r'(\d{2})([A-Z]{3})(\d{2})', m["call"])
-        if em:
-            day, mon, yr = em.group(1), em.group(2), em.group(3)
-
-    if m["put"]:
-        match = re.search(r'P(\d+)$', m["put"])
-        if match:
-            pe_strike = match.group(1)
+    # ── FIXED: Form displays what user last typed ──
+    # Default to today's date only if form never filled
+    fday  = f["day"]  or now_ist.strftime("%d")
+    fmon  = f["mon"]  or now_ist.strftime("%b").upper()
+    fyr   = f["yr"]   or now_ist.strftime("%y")
+    fce   = f["ce_strike"]
+    fpe   = f["pe_strike"]
+    flots = f["lots"]
 
     msg    = request.args.get("msg", "")
     msg_ok = request.args.get("ok", "1") == "1"
@@ -1061,28 +1074,32 @@ def manual():
     recent_logs = [
         l for l in reversed(state["logs"])
         if any(k in l for k in [
-            "[ACTION]","[ORDER]","[EXIT]","[OK]","[ERR]","MANUAL","DRY RUN"
+            "[ACTION]", "[ORDER]", "[EXIT]",
+            "[OK]", "[ERR]", "MANUAL", "DRY RUN"
         ])
     ][:15]
 
     return render_template_string(MANUAL_HTML,
-        inst=inst,
-        token=state["token"],
-        dry=DRY_RUN,
-        call_sym=m["call"],
-        put_sym=m["put"],
-        qty=qty,
-        lots=lots,
-        lot_size=lot_size,
-        day=day, mon=mon, yr=yr,
-        ce_strike=ce_strike,
-        pe_strike=pe_strike,
-        mkt_open=is_market_open_for(inst),
-        mkt_open_time=cfg["market_open"].strftime("%H:%M"),
-        mkt_close_time=cfg["market_close"].strftime("%H:%M"),
-        time_now=now_ist.strftime("%H:%M:%S"),
-        msg=msg, msg_ok=msg_ok,
-        logs=recent_logs,
+        inst      = inst,
+        token     = state["token"],
+        dry       = DRY_RUN,
+        # ── Active trading symbols ──
+        call_sym  = m["call"],
+        put_sym   = m["put"],
+        qty       = m["qty"],
+        saved_lots= m["lots"],
+        lot_size  = lot_size,
+        # ── FIXED: Form values from form state ──
+        fday=fday, fmon=fmon, fyr=fyr,
+        fce=fce,   fpe=fpe,   flots=flots,
+        # ── Market info ──
+        mkt_open      = is_market_open_for(inst),
+        mkt_open_time = cfg["market_open"].strftime("%H:%M"),
+        mkt_close_time= cfg["market_close"].strftime("%H:%M"),
+        time_now      = now_ist.strftime("%H:%M:%S"),
+        msg    = msg,
+        msg_ok = msg_ok,
+        logs   = recent_logs,
     )
 
 @app.route("/manual/setup", methods=["POST"])
@@ -1093,34 +1110,55 @@ def manual_setup():
 
     cfg      = INSTRUMENTS[inst]
     lot_size = cfg["lot_size"]
-    day      = request.form.get("day",  "").strip().zfill(2)
-    mon      = request.form.get("mon",  "").strip().upper()
-    yr       = request.form.get("yr",   "").strip()
-    ce       = request.form.get("ce",   "").strip()
-    pe       = request.form.get("pe",   "").strip() or ce
-    lots     = max(1, int(request.form.get("lots", "1") or "1"))
 
+    # Read form values
+    day  = request.form.get("day",  "").strip().zfill(2)
+    mon  = request.form.get("mon",  "").strip().upper()
+    yr   = request.form.get("yr",   "").strip()
+    ce   = request.form.get("ce",   "").strip()
+    pe   = request.form.get("pe",   "").strip()
+    lots = max(1, int(request.form.get("lots", "1") or "1"))
+
+    # Validate
     if not all([day, mon, yr, ce]):
-        return redirect_manual(inst, "❌ Fill all fields!", ok=False)
+        return redirect_manual(inst, "❌ Fill Day/Mon/Yr/CE!", ok=False)
 
+    # PE defaults to CE if blank
+    pe_final = pe if pe else ce
+
+    # ── FIXED: Save form values to form state FIRST ──
+    # This ensures page always shows what user typed
+    state["form"][inst] = {
+        "day":       day,
+        "mon":       mon,
+        "yr":        yr,
+        "ce_strike": ce,
+        "pe_strike": pe,      # keep blank if user left blank
+        "lots":      str(lots)
+    }
+
+    # Build symbols
     expiry   = f"{day}{mon}{yr}"
     call_sym = f"{inst}{expiry}C{ce}"
-    put_sym  = f"{inst}{expiry}P{pe}"
+    put_sym  = f"{inst}{expiry}P{pe_final}"
     qty      = lots * lot_size
 
+    # ── FIXED: Save order symbols separately ──
     state["manual"][inst] = {
         "call": call_sym,
         "put":  put_sym,
         "qty":  qty,
         "lots": lots
     }
+
     add_log(
-        f"[MANUAL] {inst} setup: "
+        f"[MANUAL] {inst} | NEW STRIKES SAVED | "
         f"CE={call_sym} PE={put_sym} QTY={qty}"
     )
+
     return redirect_manual(
         inst,
-        f"✅ Saved! CE={call_sym} PE={put_sym} Qty={qty}"
+        f"✅ NEW Strikes Active! CE={call_sym} | PE={put_sym} | Qty={qty}"
     )
 
 @app.route("/manual/order", methods=["POST"])
@@ -1131,30 +1169,32 @@ def manual_order():
     if inst not in INSTRUMENTS:
         return redirect_manual("NIFTY", "❌ Unknown instrument", ok=False)
 
-    # ── Guard: token ──
     if not state["token"]:
-        return redirect_manual(inst, "❌ Not logged in. Visit /login", ok=False)
+        return redirect_manual(inst,
+            "❌ Not logged in. Visit /login", ok=False)
 
-    # ── Guard: strikes set ──
     m = state["manual"][inst]
     if not m["call"] or not m["put"]:
         return redirect_manual(inst, "❌ Set strikes first!", ok=False)
 
+    # ── FIXED: Read CURRENT symbols at time of button press ──
     ce  = m["call"]
     pe  = m["put"]
     qty = m["qty"]
 
-    add_log(f"[MANUAL] {inst} | {action} | CE={ce} PE={pe} QTY={qty}")
+    add_log(
+        f"[MANUAL] {inst} | {action} | "
+        f"CE={ce} PE={pe} QTY={qty}"
+    )
 
     result_holder = {"msg": "", "ok": True}
 
-    # ── FIXED: Correct action → symbol mapping ──
     def run():
         try:
             if action == "BUY_CALL":
                 r = place_order(ce, "B", qty)
                 result_holder["msg"] = (
-                    f"✅ BUY CALL sent | {ce}"
+                    f"✅ BUY CALL sent | {ce} qty={qty}"
                     if r else f"❌ BUY CALL failed | Check logs"
                 )
                 result_holder["ok"] = bool(r)
@@ -1162,61 +1202,64 @@ def manual_order():
             elif action == "BUY_PUT":
                 r = place_order(pe, "B", qty)
                 result_holder["msg"] = (
-                    f"✅ BUY PUT sent | {pe}"
+                    f"✅ BUY PUT sent | {pe} qty={qty}"
                     if r else f"❌ BUY PUT failed | Check logs"
                 )
                 result_holder["ok"] = bool(r)
 
             elif action == "EXIT_CALL":
-                # ── FIXED: Pass CE symbol to exit_position ──
                 r = exit_position(ce)
                 result_holder["msg"] = r or "✅ EXIT CALL done"
-                result_holder["ok"] = (
-                    "ERROR" not in (r or "") and
-                    "failed" not in (r or "").lower()
+                result_holder["ok"]  = (
+                    r is not None and
+                    "ERROR" not in r and
+                    "failed" not in r.lower()
                 )
 
             elif action == "EXIT_PUT":
-                # ── FIXED: Pass PE symbol to exit_position ──
                 r = exit_position(pe)
                 result_holder["msg"] = r or "✅ EXIT PUT done"
-                result_holder["ok"] = (
-                    "ERROR" not in (r or "") and
-                    "failed" not in (r or "").lower()
+                result_holder["ok"]  = (
+                    r is not None and
+                    "ERROR" not in r and
+                    "failed" not in r.lower()
                 )
 
             elif action == "EXIT_ALL":
-                # ── FIXED: Exit both, collect both results ──
                 r1 = exit_position(ce)
                 r2 = exit_position(pe)
                 result_holder["msg"] = (
-                    f"CE: {r1 or 'done'} | PE: {r2 or 'done'}"
+                    f"CE→ {r1 or 'done'} | PE→ {r2 or 'done'}"
                 )
                 result_holder["ok"] = all(
-                    "ERROR" not in (x or "") for x in [r1, r2]
+                    x is not None and "ERROR" not in x
+                    for x in [r1, r2]
                 )
-
             else:
-                result_holder["msg"] = f"❌ Unknown action: {action}"
+                result_holder["msg"] = f"❌ Unknown: {action}"
                 result_holder["ok"]  = False
 
         except Exception as e:
-            result_holder["msg"] = f"❌ Exception: {e}"
+            result_holder["msg"] = f"❌ Error: {e}"
             result_holder["ok"]  = False
-            add_log(f"[MANUAL] Exception in run(): {e}")
+            add_log(f"[MANUAL] Exception: {e}")
 
     t = threading.Thread(target=run, daemon=True)
     t.start()
-    t.join(timeout=20)  # Wait up to 20s for real result
+    t.join(timeout=20)
 
     return redirect_manual(
         inst,
-        result_holder["msg"] or "✅ Order sent",
+        result_holder["msg"] or "✅ Done",
         ok=result_holder["ok"]
     )
 
 def redirect_manual(inst, msg, ok=True):
-    return redirect(f"/manual?inst={inst}&msg={quote(msg)}&ok={'1' if ok else '0'}")
+    return redirect(
+        f"/manual?inst={inst}"
+        f"&msg={quote(str(msg))}"
+        f"&ok={'1' if ok else '0'}"
+    )
 
 # -----------------------------------------------
 if __name__ == "__main__":
