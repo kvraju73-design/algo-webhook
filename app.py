@@ -3,7 +3,6 @@ Flattrade MULTI-INSTRUMENT - CLOUD VERSION for Railway v3
 =========================================================
 Supports: NIFTY, BANKNIFTY, CRUDEOIL
 Auto-detects instrument + CE/PE from symbol in alert
-Manual daily login (takes 30 seconds)
 """
 
 import os
@@ -63,9 +62,10 @@ INSTRUMENTS = {
     },
 }
 
+# Default fallback if instrument can't be detected
 DEFAULT_LOT_SIZE = 65
-
 # =============================================
+
 logging.basicConfig(level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)])
@@ -73,14 +73,19 @@ log = logging.getLogger(__name__)
 logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
 state = {
-    "token":            None,
-    "call_symbol":      "",
-    "put_symbol":       "",
-    "instrument":       "NIFTY",
-    "qty":              DEFAULT_LOT_SIZE,
-    "logs":             [],
-    "last_action":      {},
-    "last_login_time":  None,
+    "token":       None,
+    "call_symbol": "",
+    "put_symbol":  "",
+    "instrument":  "NIFTY",  # for /setup page default
+    "qty":         DEFAULT_LOT_SIZE,
+    "logs":        [],
+    "last_action": {},
+    # Manual trading state (per instrument)
+    "manual": {
+        "NIFTY":     {"call": "", "put": "", "qty": 65,  "lots": 1},
+        "BANKNIFTY": {"call": "", "put": "", "qty": 30,  "lots": 1},
+        "CRUDEOIL":  {"call": "", "put": "", "qty": 100, "lots": 1},
+    }
 }
 
 IST = pytz.timezone("Asia/Kolkata")
@@ -91,13 +96,15 @@ def add_log(msg):
     state["logs"] = state["logs"][-200:]
     log.info(msg)
 
-# =============================================
-# INSTRUMENT DETECTION
-# =============================================
+# -----------------------------------------------
+# INSTRUMENT DETECTION FROM SYMBOL
+# -----------------------------------------------
 def detect_instrument(symbol):
+    """Returns instrument name from symbol prefix"""
     if not symbol:
         return None
     symbol = symbol.upper()
+    # Check longest prefix first (BANKNIFTY before NIFTY)
     if symbol.startswith("BANKNIFTY"):
         return "BANKNIFTY"
     if symbol.startswith("CRUDEOIL"):
@@ -107,6 +114,7 @@ def detect_instrument(symbol):
     return None
 
 def detect_option_type(symbol):
+    """Returns 'CE' or 'PE' from symbol"""
     if not symbol:
         return None
     symbol = symbol.upper()
@@ -117,55 +125,49 @@ def detect_option_type(symbol):
     return None
 
 def get_instrument_config(symbol):
+    """Get exchange, lot_size, market hours for given symbol"""
     instrument = detect_instrument(symbol)
     if instrument and instrument in INSTRUMENTS:
         return instrument, INSTRUMENTS[instrument]
     return None, None
 
 def is_market_open_for(instrument):
+    """Check market hours for specific instrument"""
     if instrument not in INSTRUMENTS:
         return False
     cfg = INSTRUMENTS[instrument]
     now = datetime.now(IST).time()
     return cfg["market_open"] <= now <= cfg["market_close"]
 
-# =============================================
-# TOKEN LOGIN
-# =============================================
+# -----------------------------------------------
+# TOKEN
+# -----------------------------------------------
 def sha256(text):
     return hashlib.sha256(text.encode()).hexdigest()
 
 def exchange_request_code(request_code):
     hash_value = sha256(API_KEY + request_code + API_SECRET)
-    payload = {
-        "api_key": API_KEY,
-        "request_code": request_code,
-        "api_secret": hash_value
-    }
+    payload = {"api_key": API_KEY, "request_code": request_code, "api_secret": hash_value}
     try:
         r = requests.post(TOKEN_URL, json=payload, proxies=PROXIES, timeout=15)
         resp = r.json()
     except Exception as e:
         add_log(f"[LOGIN] Failed: {e}")
         return False, str(e)
-
     if resp.get("stat") != "Ok":
         err = resp.get("emsg", str(resp))
         add_log(f"[LOGIN] Failed: {err}")
         return False, err
-
     token = resp.get("token") or resp.get("susertoken")
     if not token:
         return False, "No token returned"
-
     state["token"] = token
-    state["last_login_time"] = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
-    add_log("[LOGIN] ✅ Token generated successfully.")
+    add_log("[LOGIN] Token generated successfully.")
     return True, "OK"
 
-# =============================================
-# API CALLS
-# =============================================
+# -----------------------------------------------
+# API CALLS (now instrument-aware)
+# -----------------------------------------------
 def get_token_for_symbol(symbol, exchange):
     try:
         r = requests.post(BASE_URL_ORDER + "/SearchScrip",
@@ -206,6 +208,8 @@ def get_ltp(symbol, exchange):
 
 def place_order(symbol, trantype, qty=None):
     action = "BUY" if trantype == "B" else "SELL"
+
+    # Auto-detect instrument config
     instrument, cfg = get_instrument_config(symbol)
     if not cfg:
         add_log(f"[ORDER] ERROR: Unknown instrument for symbol {symbol}")
@@ -213,6 +217,7 @@ def place_order(symbol, trantype, qty=None):
 
     exchange = cfg["exchange"]
     qty = qty or cfg["lot_size"]
+
     add_log(f"[ORDER] {action} → {symbol} | qty={qty} | {instrument} ({exchange})")
 
     if not state["token"]:
@@ -260,6 +265,7 @@ def place_order(symbol, trantype, qty=None):
 
 def exit_position(symbol, qty=None):
     add_log(f"[EXIT] Triggered for {symbol}")
+
     instrument, cfg = get_instrument_config(symbol)
     if not cfg:
         add_log(f"[EXIT] ERROR: Unknown instrument for {symbol}")
@@ -329,12 +335,13 @@ def exit_position(symbol, qty=None):
     except Exception as e:
         add_log(f"[EXIT] Exception: {e}")
 
-# =============================================
+# -----------------------------------------------
 # ACTION HANDLER
-# =============================================
+# -----------------------------------------------
 def handle_action(action, qty=None, symbol=None):
     action = action.upper().strip()
 
+    # Debounce
     dedup_key = f"{action}_{symbol or ''}"
     now = time.time()
     if now - state["last_action"].get(dedup_key, 0) < 2:
@@ -342,11 +349,13 @@ def handle_action(action, qty=None, symbol=None):
         return
     state["last_action"][dedup_key] = now
 
+    # ---- Dynamic: symbol from TradingView alert ----
     if symbol:
         symbol = symbol.strip().upper()
         instrument = detect_instrument(symbol)
         opt_type = detect_option_type(symbol)
 
+        # Use instrument's lot size if qty not specified
         if not qty and instrument in INSTRUMENTS:
             qty = INSTRUMENTS[instrument]["lot_size"]
         elif not qty:
@@ -364,6 +373,7 @@ def handle_action(action, qty=None, symbol=None):
             add_log(f"[ACTION] Unknown action: {action}")
         return
 
+    # ---- Fallback: use pre-configured CE/PE from /setup ----
     ce = state["call_symbol"]
     pe = state["put_symbol"]
     qty = qty or state["qty"]
@@ -388,9 +398,9 @@ def handle_action(action, qty=None, symbol=None):
     else:
         add_log(f"[ACTION] Unknown: {action}")
 
-# =============================================
+# -----------------------------------------------
 # FLASK APP
-# =============================================
+# -----------------------------------------------
 app = Flask(__name__)
 
 HOME_HTML = """
@@ -407,22 +417,14 @@ table{width:100%;border-collapse:collapse;background:#16213e;border-radius:8px;o
 th,td{padding:10px;text-align:left;border-bottom:1px solid #0f3460;}
 th{background:#0f3460;color:#ffd700;}
 code{background:#0a0e27;padding:3px 6px;border-radius:3px;color:#00d9ff;}
-.alert-box{background:#5d4037;padding:15px;border-radius:8px;margin:10px 0;border-left:4px solid #ff9800;}
 </style></head><body>
 <h1>🚀 Flattrade Algo — Multi-Instrument v3</h1>
 
 <div class="status">
-<b>Token:</b> <span class="{{ 'ok' if token else 'err' }}">{{ '✅ Active' if token else '❌ Not logged in - Visit /login' }}</span><br>
-<b>Last Login:</b> {{ last_login_time or 'Never' }}<br>
-<b>Mode:</b> <span class="{{ 'warn' if dry else 'ok' }}">{{ 'DRY RUN' if dry else 'LIVE' }}</span><br>
-<b>Server Time (IST):</b> {{ time_now }}
+<b>Token:</b> <span class="{{'ok' if token else 'err'}}">{{'✅ Active' if token else '❌ Not logged in'}}</span><br>
+<b>Mode:</b> <span class="{{'warn' if dry else 'ok'}}">{{'DRY RUN' if dry else 'LIVE'}}</span><br>
+<b>Server Time (IST):</b> {{time_now}}
 </div>
-
-{% if not token %}
-<div class="alert-box">
-⚠️ <b>Daily Login Required:</b> Click <a href="/login" style="color:#ffd700;background:transparent;padding:0;">🔑 Login Here</a> to generate today's token.
-</div>
-{% endif %}
 
 <h2>📊 Supported Instruments</h2>
 <table>
@@ -440,11 +442,12 @@ code{background:#0a0e27;padding:3px 6px;border-radius:3px;color:#00d9ff;}
 
 <h2>Quick Actions</h2>
 <a href="/login">🔑 Daily Login</a>
-<a href="/setup">⚙️ Strike Setup</a>
+<a href="/manual">⚡ Manual Trading</a>
+<a href="/setup">⚙️ Strike Setup (Optional)</a>
 <a href="/logs">📋 View Logs</a>
 <a href="/health">💚 Health</a>
 
-<h2>🔗 Webhook URL for TradingView</h2>
+<h2>🔗 Webhook URL for TradingView (USE HTTPS!)</h2>
 <div class="status"><code>https://{{host}}/webhook</code></div>
 
 <h2>📝 Alert JSON Examples</h2>
@@ -453,13 +456,15 @@ code{background:#0a0e27;padding:3px 6px;border-radius:3px;color:#00d9ff;}
 <code>{"action":"BUY","symbol":"NIFTY11AUG26C24500","qty":"65"}</code><br>
 <code>{"action":"SELL","symbol":"NIFTY11AUG26P24050","qty":"65"}</code><br><br>
 <b>BANKNIFTY:</b><br>
-<code>{"action":"BUY","symbol":"BANKNIFTY27AUG26C51500","qty":"30"}</code><br><br>
+<code>{"action":"BUY","symbol":"BANKNIFTY27AUG26C51500","qty":"30"}</code><br>
+<code>{"action":"SELL","symbol":"BANKNIFTY27AUG26P51000","qty":"30"}</code><br><br>
 <b>CRUDEOIL:</b><br>
-<code>{"action":"BUY","symbol":"CRUDEOIL20AUG26C6500","qty":"100"}</code>
+<code>{"action":"BUY","symbol":"CRUDEOIL20AUG26C6500","qty":"100"}</code><br>
+<code>{"action":"SELL","symbol":"CRUDEOIL20AUG26P6300","qty":"100"}</code>
 </div>
 
 <p style="color:#888;font-size:12px;margin-top:30px;">
-💡 Login takes 30 seconds daily. Token stays active for 24 hours.
+💡 Instrument auto-detected from symbol prefix. Lot size auto-applied. Market hours auto-checked.
 </p>
 </body></html>
 """
@@ -468,16 +473,13 @@ code{background:#0a0e27;padding:3px 6px;border-radius:3px;color:#00d9ff;}
 def home():
     market_status = {name: is_market_open_for(name) for name in INSTRUMENTS}
     return render_template_string(HOME_HTML,
-        token=state["token"],
-        dry=DRY_RUN,
-        last_login_time=state["last_login_time"],
-        instruments=INSTRUMENTS,
-        market_status=market_status,
+        token=state["token"], dry=DRY_RUN,
+        instruments=INSTRUMENTS, market_status=market_status,
         time_now=datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
         host=request.host)
 
 LOGIN_HTML = """
-<!DOCTYPE html><html><head><title>Daily Login</title>
+<!DOCTYPE html><html><head><title>Login</title>
 <style>body{font-family:Arial;background:#1a1a2e;color:#eee;padding:30px;max-width:700px;margin:auto;}
 h1{color:#00d9ff;}a.btn,button{background:#e94560;color:white;padding:12px 25px;border:none;
   border-radius:5px;text-decoration:none;font-size:16px;cursor:pointer;display:inline-block;}
@@ -486,46 +488,27 @@ input{width:100%;padding:10px;font-size:16px;background:#0f3460;color:white;bord
 .step{margin:20px 0;padding:15px;background:#0f3460;border-left:4px solid #00d9ff;}
 .msg{padding:15px;border-radius:5px;margin:15px 0;}
 .ok{background:#1b5e20;}.err{background:#b71c1c;}
-.tip{background:#0d47a1;padding:12px;border-radius:5px;margin:10px 0;font-size:14px;}
 </style></head><body>
 <h1>🔑 Daily Flattrade Login</h1>
-
-<div class="tip">
-⏱️ <b>This takes 30 seconds:</b><br>
-1. Click login button below (opens Flattrade)<br>
-2. Enter credentials + Google Authenticator code<br>
-3. Copy the <b>request_code</b> from URL after login<br>
-4. Paste it below and click Generate Token
-</div>
-
 {% if msg %}<div class="msg {{'ok' if success else 'err'}}">{{msg}}</div>{% endif %}
-
-<div class="step"><b>Step 1:</b> Login to Flattrade<br><br>
-<a class="btn" href="https://auth.flattrade.in/?app_key={{api_key}}" target="_blank">🚀 Open Flattrade Login</a>
+<div class="step"><b>Step 1:</b><br><br>
+<a class="btn" href="https://auth.flattrade.in/?app_key={{api_key}}" target="_blank">🚀 Login to Flattrade</a>
 </div>
-
-<div class="step"><b>Step 2:</b> After login, the URL will look like:<br>
-<code style="color:#ffd700;font-size:12px;">https://your-site.com/?request_code=ABC123XYZ&client=YOUR_ID</code><br><br>
-Copy only the request_code part (between = and &)
-</div>
-
-<form method="POST">
-<input name="request_code" placeholder="Paste request_code here" required autofocus>
-<button type="submit">Generate Token</button>
-</form>
-<br><a href="/" style="color:#00d9ff">← Back to Home</a>
+<div class="step"><b>Step 2:</b> Paste request_code from redirect URL:</div>
+<form method="POST"><input name="request_code" placeholder="Paste request_code" required autofocus>
+<button type="submit">Generate Token</button></form>
+<br><a href="/" style="color:#00d9ff">← Back</a>
 </body></html>
 """
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
-    msg = None
-    success = False
+    msg = None; success = False
     if request.method == "POST":
         code = request.form.get("request_code", "").strip()
         if code:
             success, result = exchange_request_code(code)
-            msg = "✅ Token generated successfully! You can now trade." if success else f"❌ {result}"
+            msg = "✅ Token generated!" if success else f"❌ {result}"
     return render_template_string(LOGIN_HTML, msg=msg, success=success, api_key=API_KEY)
 
 SETUP_HTML = """
@@ -541,7 +524,8 @@ button{background:#e94560;color:white;padding:12px 25px;border:none;border-radiu
 .note{background:#5d4037;padding:10px;border-radius:5px;margin:15px 0;font-size:14px;}
 </style></head><body>
 <h1>⚙️ Strike Setup (Optional Fallback)</h1>
-<div class="note">💡 <b>Note:</b> If your TradingView alert already sends the "symbol" field, this setup is NOT needed.</div>
+<div class="note">💡 <b>Note:</b> If your TradingView alert already sends the "symbol" field,
+this setup is NOT needed. Use this only for old-style alerts.</div>
 {% if saved %}<div class="ok">✅ Saved!<br>Instrument: {{instrument}}<br>
 CE: {{ce}}<br>PE: {{pe}}<br>Qty: {{qty}}</div>{% endif %}
 <div class="box"><form method="POST">
@@ -638,23 +622,340 @@ def webhook():
 def health():
     market_status = {name: is_market_open_for(name) for name in INSTRUMENTS}
     return jsonify({
-        "status":          "running",
-        "dry_run":         DRY_RUN,
-        "last_login_time": state["last_login_time"],
-        "token_ok":        bool(state["token"]),
-        "ce":              state["call_symbol"],
-        "pe":              state["put_symbol"],
-        "qty":             state["qty"],
-        "instruments": {
-            name: {
-                "exchange":    cfg["exchange"],
-                "lot_size":    cfg["lot_size"],
-                "market_open": market_status[name]
-            }
-            for name, cfg in INSTRUMENTS.items()
-        },
+        "status": "running", "dry_run": DRY_RUN,
+        "ce": state["call_symbol"], "pe": state["put_symbol"],
+        "qty": state["qty"], "token_ok": bool(state["token"]),
+        "instruments": {name: {"exchange": cfg["exchange"],
+                               "lot_size": cfg["lot_size"],
+                               "market_open": market_status[name]}
+                        for name, cfg in INSTRUMENTS.items()},
         "time_ist": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
     }), 200
+
+MANUAL_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+<title>Manual Trading</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: Arial, sans-serif; background: #1a1a2e; color: #eee;
+       padding: 12px; max-width: 480px; margin: auto; }
+h1 { color: #00d9ff; font-size: 20px; margin-bottom: 10px; text-align: center; }
+h2 { color: #ffd700; font-size: 15px; margin: 14px 0 6px; }
+
+/* Token warning */
+.warn-box { background: #7b1c1c; border-radius: 8px; padding: 10px 14px;
+            margin-bottom: 12px; font-size: 13px; text-align: center; }
+.ok-box   { background: #1b5e20; border-radius: 8px; padding: 8px 14px;
+            margin-bottom: 12px; font-size: 13px; text-align: center; }
+
+/* Tabs */
+.tabs { display: flex; gap: 6px; margin-bottom: 14px; }
+.tab  { flex: 1; padding: 10px 4px; text-align: center; border-radius: 8px;
+        background: #0f3460; color: #aaa; font-size: 13px; font-weight: bold;
+        cursor: pointer; border: 2px solid transparent; text-decoration: none; }
+.tab.active { background: #e94560; color: white; border-color: #ff6b6b; }
+
+/* Setup form */
+.card { background: #16213e; border-radius: 10px; padding: 14px; margin-bottom: 14px; }
+label { display: block; color: #ffd700; font-size: 12px; margin: 8px 0 3px; }
+input, select { width: 100%; padding: 9px 10px; font-size: 15px;
+                background: #0f3460; color: white; border: 1px solid #00d9ff;
+                border-radius: 6px; }
+.row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.row3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
+.save-btn { width: 100%; margin-top: 12px; padding: 13px; font-size: 16px;
+            background: #00d9ff; color: #000; border: none; border-radius: 8px;
+            font-weight: bold; cursor: pointer; }
+.save-btn:active { background: #0099bb; }
+
+/* Symbol display */
+.sym-box { background: #0a0e27; border-radius: 8px; padding: 10px 12px;
+           margin-bottom: 12px; font-size: 13px; line-height: 1.8; }
+.sym-box span { color: #00d9ff; font-weight: bold; }
+.lot-info { color: #ffd700; }
+
+/* Trading buttons */
+.btn-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px; }
+.btn { padding: 22px 10px; font-size: 17px; font-weight: bold; border: none;
+       border-radius: 10px; cursor: pointer; width: 100%; letter-spacing: 0.5px; }
+.btn:active { opacity: 0.8; transform: scale(0.97); }
+.buy-call  { background: #1b5e20; color: #69f0ae; border: 2px solid #4caf50; }
+.buy-put   { background: #b71c1c; color: #ff8a80; border: 2px solid #f44336; }
+.exit-call { background: #1a237e; color: #82b1ff; border: 2px solid #3f51b5; }
+.exit-put  { background: #4a148c; color: #ea80fc; border: 2px solid #9c27b0; }
+.exit-all  { width: 100%; padding: 16px; font-size: 16px; font-weight: bold;
+             background: #e65100; color: white; border: none; border-radius: 10px;
+             cursor: pointer; margin-bottom: 10px; }
+.exit-all:active { opacity: 0.8; }
+
+/* Flash message */
+.flash { padding: 10px 14px; border-radius: 8px; margin-bottom: 10px;
+         font-size: 13px; text-align: center; font-weight: bold; }
+.flash.ok  { background: #1b5e20; color: #69f0ae; }
+.flash.err { background: #7b1c1c; color: #ff8a80; }
+
+/* Market status */
+.mkt { font-size: 12px; text-align: center; margin-bottom: 10px; color: #aaa; }
+.mkt .open   { color: #4caf50; }
+.mkt .closed { color: #f44336; }
+
+/* Logs */
+.log-box { background: #0a0e27; border-radius: 8px; padding: 10px;
+           font-size: 11px; color: #0f0; max-height: 160px; overflow-y: auto;
+           font-family: monospace; margin-top: 10px; }
+a.back { display: block; text-align: center; margin-top: 14px;
+         color: #00d9ff; font-size: 13px; }
+</style>
+</head>
+<body>
+
+<h1>⚡ Manual Trading</h1>
+
+{% if not token %}
+<div class="warn-box">❌ Not logged in — <a href="/login" style="color:#ffcdd2">Login first</a></div>
+{% else %}
+<div class="ok-box">✅ Token Active &nbsp;|&nbsp;
+  <span style="color:#ffd700">{{ "DRY RUN" if dry else "LIVE" }}</span>
+</div>
+{% endif %}
+
+<!-- Instrument Tabs -->
+<div class="tabs">
+  <a href="/manual?inst=NIFTY"     class="tab {{ 'active' if inst=='NIFTY' }}">NIFTY</a>
+  <a href="/manual?inst=BANKNIFTY" class="tab {{ 'active' if inst=='BANKNIFTY' }}">BNIFTY</a>
+  <a href="/manual?inst=CRUDEOIL"  class="tab {{ 'active' if inst=='CRUDEOIL' }}">CRUDE</a>
+</div>
+
+<!-- Flash message -->
+{% if msg %}
+<div class="flash {{ 'ok' if msg_ok else 'err' }}">{{ msg }}</div>
+{% endif %}
+
+<!-- Market Status -->
+<div class="mkt">
+  Market:
+  {% if mkt_open %}
+    <span class="open">🟢 OPEN</span>
+  {% else %}
+    <span class="closed">🔴 CLOSED ({{ mkt_open_time }} – {{ mkt_close_time }} IST)</span>
+  {% endif %}
+  &nbsp;|&nbsp; {{ time_now }}
+</div>
+
+<!-- Strike Setup -->
+<div class="card">
+  <h2>⚙️ Strike Setup — {{ inst }}</h2>
+  <form method="POST" action="/manual/setup">
+    <input type="hidden" name="inst" value="{{ inst }}">
+    <div class="row3">
+      <div><label>Day</label><input name="day" value="{{ day }}" maxlength="2" placeholder="DD"></div>
+      <div><label>Month</label><input name="mon" value="{{ mon }}" maxlength="3" placeholder="AUG"></div>
+      <div><label>Year</label><input name="yr"  value="{{ yr  }}" maxlength="2" placeholder="26"></div>
+    </div>
+    <div class="row2">
+      <div><label>CE Strike</label><input name="ce" value="{{ ce_strike }}" placeholder="24500"></div>
+      <div><label>PE Strike</label><input name="pe" value="{{ pe_strike }}" placeholder="same as CE"></div>
+    </div>
+    <div class="row2">
+      <div><label>Lots</label><input name="lots" type="number" value="{{ lots }}" min="1"></div>
+      <div><label>Qty (auto)</label><input value="{{ qty }} ({{ lots }}×{{ lot_size }})" disabled style="color:#aaa"></div>
+    </div>
+    <button type="submit" class="save-btn">💾 Save Strikes</button>
+  </form>
+</div>
+
+<!-- Symbol Display -->
+{% if call_sym and put_sym %}
+<div class="sym-box">
+  📞 CE: <span>{{ call_sym }}</span><br>
+  📉 PE: <span>{{ put_sym }}</span><br>
+  <span class="lot-info">📦 Qty: {{ qty }} ({{ lots }} lot × {{ lot_size }})</span>
+</div>
+
+<!-- Trading Buttons -->
+<div class="btn-grid">
+  <form method="POST" action="/manual/order">
+    <input type="hidden" name="inst" value="{{ inst }}">
+    <input type="hidden" name="action" value="BUY_CALL">
+    <button type="submit" class="btn buy-call">📈 BUY<br>CALL</button>
+  </form>
+  <form method="POST" action="/manual/order">
+    <input type="hidden" name="inst" value="{{ inst }}">
+    <input type="hidden" name="action" value="BUY_PUT">
+    <button type="submit" class="btn buy-put">📉 BUY<br>PUT</button>
+  </form>
+  <form method="POST" action="/manual/order">
+    <input type="hidden" name="inst" value="{{ inst }}">
+    <input type="hidden" name="action" value="EXIT_CALL">
+    <button type="submit" class="btn exit-call">🚪 EXIT<br>CALL</button>
+  </form>
+  <form method="POST" action="/manual/order">
+    <input type="hidden" name="inst" value="{{ inst }}">
+    <input type="hidden" name="action" value="EXIT_PUT">
+    <button type="submit" class="btn exit-put">🚪 EXIT<br>PUT</button>
+  </form>
+</div>
+<form method="POST" action="/manual/order">
+  <input type="hidden" name="inst" value="{{ inst }}">
+  <input type="hidden" name="action" value="EXIT_ALL">
+  <button type="submit" class="exit-all">⛔ EXIT ALL (CE + PE)</button>
+</form>
+{% else %}
+<div class="warn-box" style="margin-top:10px;">
+  ⚠️ Enter strike details above and tap <b>Save Strikes</b> to enable trading buttons.
+</div>
+{% endif %}
+
+<!-- Recent Logs -->
+{% if logs %}
+<h2 style="margin-top:14px;">📋 Recent Activity</h2>
+<div class="log-box">{% for l in logs %}{{ l }}<br>{% endfor %}</div>
+{% endif %}
+
+<a href="/" class="back">← Back to Dashboard</a>
+
+</body>
+</html>
+"""
+
+@app.route("/manual", methods=["GET"])
+def manual():
+    inst = request.args.get("inst", "NIFTY").upper()
+    if inst not in INSTRUMENTS:
+        inst = "NIFTY"
+
+    cfg     = INSTRUMENTS[inst]
+    m       = state["manual"][inst]
+    now_ist = datetime.now(IST)
+
+    # Parse existing symbol for display
+    lots     = m["lots"]
+    lot_size = cfg["lot_size"]
+    qty      = lots * lot_size
+
+    # Default expiry fields from today
+    day = now_ist.strftime("%d")
+    mon = now_ist.strftime("%b").upper()
+    yr  = now_ist.strftime("%y")
+
+    # Extract strike from saved symbol if available
+    ce_strike = ""
+    pe_strike = ""
+    if m["call"]:
+        # e.g. NIFTY11AUG26C24500 → 24500
+        match = re.search(r'C(\d+)$', m["call"])
+        if match:
+            ce_strike = match.group(1)
+        # extract expiry day/mon/yr from symbol
+        em = re.search(r'(\d{2})([A-Z]{3})(\d{2})', m["call"])
+        if em:
+            day, mon, yr = em.group(1), em.group(2), em.group(3)
+    if m["put"]:
+        match = re.search(r'P(\d+)$', m["put"])
+        if match:
+            pe_strike = match.group(1)
+
+    # Flash message from redirect
+    msg    = request.args.get("msg", "")
+    msg_ok = request.args.get("ok", "1") == "1"
+
+    recent_logs = [l for l in reversed(state["logs"]) if any(
+        k in l for k in ["[ACTION]","[ORDER]","[EXIT]","[OK]","[ERR]","MANUAL"]
+    )][:10]
+
+    return render_template_string(MANUAL_HTML,
+        inst=inst, token=state["token"], dry=DRY_RUN,
+        call_sym=m["call"], put_sym=m["put"],
+        qty=qty, lots=lots, lot_size=lot_size,
+        day=day, mon=mon, yr=yr,
+        ce_strike=ce_strike, pe_strike=pe_strike,
+        mkt_open=is_market_open_for(inst),
+        mkt_open_time=cfg["market_open"].strftime("%H:%M"),
+        mkt_close_time=cfg["market_close"].strftime("%H:%M"),
+        time_now=now_ist.strftime("%H:%M:%S"),
+        msg=msg, msg_ok=msg_ok,
+        logs=recent_logs,
+    )
+
+@app.route("/manual/setup", methods=["POST"])
+def manual_setup():
+    inst = request.form.get("inst", "NIFTY").upper()
+    if inst not in INSTRUMENTS:
+        inst = "NIFTY"
+
+    cfg       = INSTRUMENTS[inst]
+    lot_size  = cfg["lot_size"]
+    day       = request.form.get("day", "").strip().zfill(2)
+    mon       = request.form.get("mon", "").strip().upper()
+    yr        = request.form.get("yr",  "").strip()
+    ce        = request.form.get("ce",  "").strip()
+    pe        = request.form.get("pe",  "").strip() or ce
+    lots      = max(1, int(request.form.get("lots", "1") or "1"))
+
+    if not all([day, mon, yr, ce]):
+        return redirect_manual(inst, "❌ Fill all fields!", ok=False)
+
+    expiry   = f"{day}{mon}{yr}"
+    call_sym = f"{inst}{expiry}C{ce}"
+    put_sym  = f"{inst}{expiry}P{pe}"
+    qty      = lots * lot_size
+
+    state["manual"][inst] = {"call": call_sym, "put": put_sym, "qty": qty, "lots": lots}
+    add_log(f"[MANUAL] {inst} setup: CE={call_sym} PE={put_sym} QTY={qty}")
+
+    return redirect_manual(inst, f"✅ Saved! CE={call_sym} PE={put_sym} Qty={qty}")
+
+@app.route("/manual/order", methods=["POST"])
+def manual_order():
+    inst   = request.form.get("inst", "NIFTY").upper()
+    action = request.form.get("action", "").upper()
+
+    if inst not in INSTRUMENTS:
+        return redirect_manual(inst, "❌ Unknown instrument", ok=False)
+
+    m = state["manual"][inst]
+    if not m["call"] or not m["put"]:
+        return redirect_manual(inst, "❌ Set strikes first!", ok=False)
+
+    if not state["token"]:
+        return redirect_manual(inst, "❌ Not logged in. Visit /login", ok=False)
+
+    ce  = m["call"]
+    pe  = m["put"]
+    qty = m["qty"]
+
+    add_log(f"[MANUAL] {inst} action={action} CE={ce} PE={pe} QTY={qty}")
+
+    def run():
+        if action == "BUY_CALL":
+            place_order(ce, "B", qty)
+        elif action == "BUY_PUT":
+            place_order(pe, "B", qty)
+        elif action == "EXIT_CALL":
+            exit_position(ce, qty)
+        elif action == "EXIT_PUT":
+            exit_position(pe, qty)
+        elif action == "EXIT_ALL":
+            exit_position(ce, qty)
+            exit_position(pe, qty)
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(timeout=12)  # Wait up to 12s for result (faster feedback)
+
+    # Get last log entry for feedback
+    last = state["logs"][-1] if state["logs"] else ""
+    ok   = "[OK]" in last or "DRY RUN" in last
+    return redirect_manual(inst, last.split("] ", 1)[-1] if last else "✅ Order sent", ok=ok)
+
+def redirect_manual(inst, msg, ok=True):
+    from flask import redirect as flask_redirect
+    from urllib.parse import quote
+    return flask_redirect(f"/manual?inst={inst}&msg={quote(msg)}&ok={'1' if ok else '0'}")
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
