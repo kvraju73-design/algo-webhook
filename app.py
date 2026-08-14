@@ -1,7 +1,9 @@
 """
-Flattrade MULTI-INSTRUMENT - CLOUD VERSION for Railway v4
-FIXED: Strike price update issue - new strikes now apply immediately
-+ KEEP-ALIVE: Background thread pings /health every 4 min to prevent Railway sleep
+Flattrade MULTI-INSTRUMENT - CLOUD VERSION v5
+FIXES:
+  - PRODUCT default changed to "I" (MIS) so margin requirement is lower
+  - Price buffer increased to 1% for better fill rate on fast-moving contracts
+  - Cleaner code, same features
 """
 
 import os
@@ -19,6 +21,8 @@ import pytz
 from urllib.parse import quote
 
 # =============================================
+# ENVIRONMENT CONFIG
+# =============================================
 USER_ID        = os.environ.get("USER_ID", "")
 API_KEY        = os.environ.get("API_KEY", "")
 API_SECRET     = os.environ.get("API_SECRET", "")
@@ -26,11 +30,14 @@ PROXY_HOST     = os.environ.get("PROXY_HOST", "")
 PROXY_PORT     = os.environ.get("PROXY_PORT", "443")
 PROXY_USER     = os.environ.get("PROXY_USER", "")
 PROXY_PASS     = os.environ.get("PROXY_PASS", "")
-PRODUCT        = os.environ.get("PRODUCT", "M")
+
+# ✅ FIX 1: Changed from "M" (NRML) to "I" (MIS)
+# MIS requires far less margin (~20-40K vs ~1.8L for NRML)
+# ⚠️  MIS auto-squares off at 11:30 PM for MCX — make sure exit runs before then
+PRODUCT        = os.environ.get("PRODUCT", "I")
+
 DRY_RUN        = os.environ.get("DRY_RUN", "False").lower() == "true"
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
-# ── KEEP-ALIVE: Set your Railway app URL as env var SELF_URL ──
-# e.g. https://your-app-name.up.railway.app
 SELF_URL       = os.environ.get("SELF_URL", "")
 
 PROXIES = {
@@ -66,6 +73,8 @@ INSTRUMENTS = {
 }
 DEFAULT_LOT_SIZE = 65
 
+# =============================================
+# LOGGING
 # =============================================
 logging.basicConfig(
     level=logging.INFO,
@@ -103,6 +112,7 @@ state = {
 
 IST = pytz.timezone("Asia/Kolkata")
 
+
 def add_log(msg):
     ts    = datetime.now(IST).strftime("%H:%M:%S")
     entry = f"[{ts}] {msg}"
@@ -111,13 +121,11 @@ def add_log(msg):
     log.info(msg)
     return entry
 
+
 # =============================================
-# KEEP-ALIVE THREAD
-# Pings /health on this app every 4 minutes
-# so Railway free plan never puts it to sleep
+# KEEP-ALIVE THREAD (pings /health every 4 min)
 # =============================================
 def keep_alive_loop():
-    # Wait 30s after startup before first ping
     time.sleep(30)
     while True:
         try:
@@ -126,22 +134,20 @@ def keep_alive_loop():
                 r   = requests.get(url, timeout=10)
                 log.info(f"[KEEP-ALIVE] Pinged {url} → {r.status_code}")
             else:
-                log.warning("[KEEP-ALIVE] SELF_URL not set — ping skipped. "
-                            "Add SELF_URL env var in Railway.")
+                log.warning("[KEEP-ALIVE] SELF_URL not set — skipping.")
         except Exception as e:
             log.warning(f"[KEEP-ALIVE] Ping failed: {e}")
-        # Sleep 4 minutes (Railway sleeps after ~5 min of inactivity)
         time.sleep(4 * 60)
 
-keep_alive_thread = threading.Thread(
+threading.Thread(
     target=keep_alive_loop, daemon=True, name="keep-alive"
-)
-keep_alive_thread.start()
+).start()
 log.info("[KEEP-ALIVE] Background ping thread started.")
 
-# -----------------------------------------------
-# INSTRUMENT DETECTION
-# -----------------------------------------------
+
+# =============================================
+# INSTRUMENT HELPERS
+# =============================================
 def detect_instrument(symbol):
     if not symbol:
         return None
@@ -154,21 +160,13 @@ def detect_instrument(symbol):
         return "NIFTY"
     return None
 
-def detect_option_type(symbol):
-    if not symbol:
-        return None
-    symbol = symbol.upper()
-    if re.search(r'C\d+$', symbol):
-        return 'CE'
-    if re.search(r'P\d+$', symbol):
-        return 'PE'
-    return None
 
 def get_instrument_config(symbol):
     instrument = detect_instrument(symbol)
     if instrument and instrument in INSTRUMENTS:
         return instrument, INSTRUMENTS[instrument]
     return None, None
+
 
 def is_market_open_for(instrument):
     if instrument not in INSTRUMENTS:
@@ -177,11 +175,13 @@ def is_market_open_for(instrument):
     now = datetime.now(IST).time()
     return cfg["market_open"] <= now <= cfg["market_close"]
 
-# -----------------------------------------------
-# TOKEN
-# -----------------------------------------------
+
+# =============================================
+# TOKEN / LOGIN
+# =============================================
 def sha256(text):
     return hashlib.sha256(text.encode()).hexdigest()
+
 
 def exchange_request_code(request_code):
     hash_value = sha256(API_KEY + request_code + API_SECRET)
@@ -191,8 +191,7 @@ def exchange_request_code(request_code):
         "api_secret":   hash_value
     }
     try:
-        r    = requests.post(TOKEN_URL, json=payload,
-                             proxies=PROXIES, timeout=15)
+        r    = requests.post(TOKEN_URL, json=payload, proxies=PROXIES, timeout=15)
         resp = r.json()
     except Exception as e:
         add_log(f"[LOGIN] Failed: {e}")
@@ -211,9 +210,10 @@ def exchange_request_code(request_code):
     add_log("[LOGIN] Token generated successfully.")
     return True, "OK"
 
-# -----------------------------------------------
+
+# =============================================
 # API CALLS
-# -----------------------------------------------
+# =============================================
 def get_token_for_symbol(symbol, exchange):
     try:
         r = requests.post(
@@ -239,6 +239,7 @@ def get_token_for_symbol(symbol, exchange):
     except Exception as e:
         add_log(f"[LOOKUP] Exception: {e}")
     return None
+
 
 def get_ltp(symbol, exchange):
     tk = get_token_for_symbol(symbol, exchange)
@@ -266,18 +267,19 @@ def get_ltp(symbol, exchange):
         add_log(f"[LTP] Exception: {e}")
     return None
 
+
 def place_order(symbol, trantype, qty=None):
     action = "BUY" if trantype == "B" else "SELL"
 
     instrument, cfg = get_instrument_config(symbol)
     if not cfg:
-        add_log(f"[ORDER] ERROR: Unknown instrument for symbol {symbol}")
+        add_log(f"[ORDER] ERROR: Unknown instrument for {symbol}")
         return None
 
     exchange = cfg["exchange"]
     qty      = qty or cfg["lot_size"]
 
-    add_log(f"[ORDER] {action} → {symbol} | qty={qty} | {instrument} ({exchange})")
+    add_log(f"[ORDER] {action} → {symbol} | qty={qty} | product={PRODUCT} | {instrument} ({exchange})")
 
     if not state["token"]:
         add_log("[ORDER] ERROR: No token. Visit /login first!")
@@ -294,8 +296,10 @@ def place_order(symbol, trantype, qty=None):
         add_log("[ORDER] LTP fetch failed. Aborting.")
         return None
 
-    price = (round(ltp * 1.005, 1) if trantype == "B"
-             else round(ltp * 0.995, 1))
+    # ✅ FIX 2: Increased price buffer from 0.5% to 1% for better fill rate
+    # Crude Oil moves fast — 0.5% buffer was causing missed fills
+    price = (round(ltp * 1.01, 1) if trantype == "B"
+             else round(ltp * 0.99, 1))
 
     if DRY_RUN:
         add_log(f"[DRY RUN] {action} {qty} {symbol} @ {price} (LTP {ltp})")
@@ -318,19 +322,17 @@ def place_order(symbol, trantype, qty=None):
         resp = r.json()
         if resp.get("stat") == "Ok":
             ordno = resp.get("norenordno", "")
-            add_log(
-                f"[OK] ORDER PLACED | {action} {qty} "
-                f"{symbol} @ {price} | No: {ordno}"
-            )
+            add_log(f"[OK] ORDER PLACED | {action} {qty} {symbol} @ {price} | No: {ordno}")
             return ordno
         add_log(f"[ERR] ORDER FAILED | {resp.get('emsg')}")
     except Exception as e:
         add_log(f"[ERR] Exception: {e}")
     return None
 
-# -----------------------------------------------
+
+# =============================================
 # EXIT POSITION
-# -----------------------------------------------
+# =============================================
 def exit_position(symbol):
     add_log(f"[EXIT] Triggered for {symbol}")
 
@@ -342,7 +344,7 @@ def exit_position(symbol):
     exchange = cfg["exchange"]
 
     if not state["token"]:
-        add_log("[EXIT] ERROR: No token. Visit /login first!")
+        add_log("[EXIT] ERROR: No token.")
         return "ERROR: No token"
 
     if not DRY_RUN and not is_market_open_for(instrument):
@@ -359,10 +361,8 @@ def exit_position(symbol):
         r = requests.post(
             BASE_URL_ORDER + "/PositionBook",
             data=(
-                "jData=" + json.dumps({
-                    "uid":   USER_ID,
-                    "actid": USER_ID
-                }) + "&jKey=" + state["token"]
+                "jData=" + json.dumps({"uid": USER_ID, "actid": USER_ID})
+                + "&jKey=" + state["token"]
             ),
             headers={"Content-Type": "application/x-www-form-urlencoded"},
             proxies=PROXIES, timeout=10
@@ -370,10 +370,7 @@ def exit_position(symbol):
         resp_data = r.json()
 
         if isinstance(resp_data, dict):
-            add_log(
-                f"[EXIT] PositionBook error: "
-                f"{resp_data.get('emsg', resp_data)}"
-            )
+            add_log(f"[EXIT] PositionBook error: {resp_data.get('emsg', resp_data)}")
             return f"ERROR: {resp_data.get('emsg', 'No positions')}"
 
         if not isinstance(resp_data, list) or len(resp_data) == 0:
@@ -387,10 +384,8 @@ def exit_position(symbol):
             target_clean = re.sub(r'[^A-Z0-9]', '', target_sym.upper())
             if pos_clean == target_clean:
                 return True
-            m1 = re.search(
-                r'^([A-Z]+)\d+[A-Z]+\d+(C|P)(\d+)$', pos_sym.upper())
-            m2 = re.search(
-                r'^([A-Z]+)\d+[A-Z]+\d+(C|P)(\d+)$', target_sym.upper())
+            m1 = re.search(r'^([A-Z]+)\d+[A-Z]+\d+(C|P)(\d+)$', pos_sym.upper())
+            m2 = re.search(r'^([A-Z]+)\d+[A-Z]+\d+(C|P)(\d+)$', target_sym.upper())
             if m1 and m2:
                 return (m1.group(1) == m2.group(1) and
                         m1.group(2) == m2.group(2) and
@@ -416,19 +411,16 @@ def exit_position(symbol):
             exit_qty = abs(net_qty)
             action   = "SELL" if trantype == "S" else "BUY"
 
-            add_log(
-                f"[EXIT] Found {pos_sym} netqty={net_qty} "
-                f"→ {action} {exit_qty}"
-            )
+            add_log(f"[EXIT] Found {pos_sym} netqty={net_qty} → {action} {exit_qty}")
 
             ltp = get_ltp(pos_sym, exchange)
             if ltp is None:
-                ltp = float(pos.get("lp", 0)) or float(
-                    pos.get("upldprc", 100))
+                ltp = float(pos.get("lp", 0)) or float(pos.get("upldprc", 100))
                 add_log(f"[EXIT] Using fallback LTP: {ltp}")
 
-            price = (round(ltp * 0.995, 1) if trantype == "S"
-                     else round(ltp * 1.005, 1))
+            # ✅ FIX 2 applied here too: 1% buffer
+            price = (round(ltp * 0.99, 1) if trantype == "S"
+                     else round(ltp * 1.01, 1))
 
             sq_payload = {
                 "uid":      USER_ID, "actid":    USER_ID,
@@ -439,10 +431,7 @@ def exit_position(symbol):
             }
             sq_r    = requests.post(
                 BASE_URL_ORDER + "/PlaceOrder",
-                data=(
-                    "jData=" + json.dumps(sq_payload) +
-                    "&jKey=" + state["token"]
-                ),
+                data="jData=" + json.dumps(sq_payload) + "&jKey=" + state["token"],
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
                 proxies=PROXIES, timeout=8
             )
@@ -450,10 +439,7 @@ def exit_position(symbol):
 
             if sq_resp.get("stat") == "Ok":
                 ordno  = sq_resp.get("norenordno", "")
-                result = (
-                    f"EXITED {pos_sym} qty={exit_qty} "
-                    f"@ {price} | Order#{ordno}"
-                )
+                result = f"EXITED {pos_sym} qty={exit_qty} @ {price} | Order#{ordno}"
                 add_log(f"[OK] {result}")
             else:
                 err    = sq_resp.get("emsg", "Unknown error")
@@ -461,14 +447,8 @@ def exit_position(symbol):
                 add_log(f"[ERR] {result}")
 
         if not found:
-            available = [
-                p.get("tsym", "") for p in resp_data
-                if int(p.get("netqty", 0)) != 0
-            ]
-            msg = (
-                f"[EXIT] {symbol} not found. "
-                f"Open positions: {available}"
-            )
+            available = [p.get("tsym", "") for p in resp_data if int(p.get("netqty", 0)) != 0]
+            msg = f"[EXIT] {symbol} not found. Open positions: {available}"
             add_log(msg)
             return f"Not in positions. Open: {available}"
 
@@ -478,9 +458,10 @@ def exit_position(symbol):
         add_log(f"[EXIT] Exception: {e}")
         return f"ERROR: {e}"
 
-# -----------------------------------------------
-# ACTION HANDLER (Webhook)
-# -----------------------------------------------
+
+# =============================================
+# WEBHOOK ACTION HANDLER
+# =============================================
 def handle_action(action, qty=None, symbol=None):
     action = action.upper().strip()
 
@@ -500,15 +481,11 @@ def handle_action(action, qty=None, symbol=None):
         elif not qty:
             qty = DEFAULT_LOT_SIZE
 
-        add_log(
-            f"[ACTION] {action} | {symbol} | "
-            f"Instrument={instrument} | Qty={qty}"
-        )
+        add_log(f"[ACTION] {action} | {symbol} | Instrument={instrument} | Qty={qty}")
 
         if action in ("BUY", "BUY_CALL", "BUY_PUT"):
             place_order(symbol, "B", qty)
-        elif action in ("SELL", "EXIT", "EXIT_CALL",
-                        "EXIT_PUT", "EXIT_ALL"):
+        elif action in ("SELL", "EXIT", "EXIT_CALL", "EXIT_PUT", "EXIT_ALL"):
             exit_position(symbol)
         elif action in ("SELL_SHORT", "SHORT"):
             place_order(symbol, "S", qty)
@@ -521,10 +498,7 @@ def handle_action(action, qty=None, symbol=None):
     qty = qty or state["qty"]
 
     if not ce or not pe:
-        add_log(
-            "[ACTION] ERROR: No symbol in alert "
-            "AND strikes not set at /setup!"
-        )
+        add_log("[ACTION] ERROR: No symbol in alert AND strikes not set at /setup!")
         return
 
     action_map = {
@@ -543,14 +517,15 @@ def handle_action(action, qty=None, symbol=None):
     else:
         add_log(f"[ACTION] Unknown: {action}")
 
-# -----------------------------------------------
+
+# =============================================
 # FLASK APP
-# -----------------------------------------------
+# =============================================
 app = Flask(__name__)
 
-# -----------------------------------------------
+# =============================================
 # HTML TEMPLATES
-# -----------------------------------------------
+# =============================================
 HOME_HTML = """
 <!DOCTYPE html><html><head><title>Flattrade Multi-Instrument</title>
 <style>
@@ -568,7 +543,7 @@ th,td{padding:10px;text-align:left;border-bottom:1px solid #0f3460;}
 th{background:#0f3460;color:#ffd700;}
 code{background:#0a0e27;padding:3px 6px;border-radius:3px;color:#00d9ff;}
 </style></head><body>
-<h1>🚀 Flattrade Algo — Multi-Instrument v4</h1>
+<h1>🚀 Flattrade Algo — Multi-Instrument v5</h1>
 <div class="status">
 <b>Token:</b>
 <span class="{{ 'ok' if token else 'err' }}">
@@ -578,12 +553,24 @@ code{background:#0a0e27;padding:3px 6px;border-radius:3px;color:#00d9ff;}
 <span class="{{ 'warn' if dry else 'ok' }}">
   {{ 'DRY RUN' if dry else 'LIVE' }}
 </span><br>
+<b>Product:</b>
+<span class="{{ 'ok' if product == 'I' else 'warn' }}">
+  {{ 'MIS (Intraday) ✅' if product == 'I' else 'NRML ⚠️ High margin needed' }}
+</span><br>
 <b>Keep-Alive:</b>
 <span class="{{ 'ok' if self_url else 'warn' }}">
   {{ '✅ Active → ' + self_url if self_url else '⚠️ SELF_URL not set' }}
 </span><br>
 <b>Server Time (IST):</b> {{ time_now }}
 </div>
+
+{% if product != 'I' %}
+<div style="background:#7b1c1c;padding:12px;border-radius:8px;margin:10px 0;">
+  ⚠️ <b>WARNING:</b> PRODUCT is set to NRML. This requires ~₹1.8L margin per lot.
+  Set env var <code>PRODUCT=I</code> for MIS (lower margin).
+</div>
+{% endif %}
+
 <h2>📊 Supported Instruments</h2>
 <table>
 <tr><th>Instrument</th><th>Exchange</th><th>Lot Size</th>
@@ -592,8 +579,7 @@ code{background:#0a0e27;padding:3px 6px;border-radius:3px;color:#00d9ff;}
 <tr>
 <td><b>{{ name }}</b></td><td>{{ cfg.exchange }}</td>
 <td>{{ cfg.lot_size }}</td>
-<td>{{ cfg.market_open.strftime('%H:%M') }} -
-    {{ cfg.market_close.strftime('%H:%M') }}</td>
+<td>{{ cfg.market_open.strftime('%H:%M') }} - {{ cfg.market_close.strftime('%H:%M') }}</td>
 <td>{% if market_status[name] %}
 <span class="ok">🟢 OPEN</span>
 {% else %}<span class="warn">🔴 CLOSED</span>{% endif %}</td>
@@ -629,15 +615,12 @@ input{width:100%;padding:10px;font-size:16px;background:#0f3460;
 <div class="msg {{ 'ok' if success else 'err' }}">{{ msg }}</div>
 {% endif %}
 <div class="step"><b>Step 1:</b><br><br>
-<a class="btn"
-   href="https://auth.flattrade.in/?app_key={{ api_key }}"
-   target="_blank">🚀 Login to Flattrade</a></div>
-<div class="step">
-  <b>Step 2:</b> Paste request_code from redirect URL:
-</div>
+<a class="btn" href="https://auth.flattrade.in/?app_key={{ api_key }}" target="_blank">
+  🚀 Login to Flattrade
+</a></div>
+<div class="step"><b>Step 2:</b> Paste request_code from redirect URL:</div>
 <form method="POST">
-<input name="request_code" placeholder="Paste request_code"
-       required autofocus>
+<input name="request_code" placeholder="Paste request_code" required autofocus>
 <button type="submit">Generate Token</button>
 </form>
 <br><a href="/" style="color:#00d9ff">← Back</a>
@@ -654,101 +637,78 @@ MANUAL_HTML = """
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { font-family: Arial, sans-serif; background: #1a1a2e;
        color: #eee; padding: 12px; max-width: 480px; margin: auto; }
-h1  { color: #00d9ff; font-size: 20px; margin-bottom: 10px;
-      text-align: center; }
+h1  { color: #00d9ff; font-size: 20px; margin-bottom: 10px; text-align: center; }
 h2  { color: #ffd700; font-size: 15px; margin: 14px 0 6px; }
-
 .warn-box { background: #7b1c1c; border-radius: 8px;
             padding: 10px 14px; margin-bottom: 12px;
             font-size: 13px; text-align: center; }
 .ok-box   { background: #1b5e20; border-radius: 8px;
             padding: 8px 14px; margin-bottom: 12px;
             font-size: 13px; text-align: center; }
-
 .tabs { display: flex; gap: 6px; margin-bottom: 14px; }
 .tab  { flex: 1; padding: 10px 4px; text-align: center;
         border-radius: 8px; background: #0f3460; color: #aaa;
         font-size: 13px; font-weight: bold; cursor: pointer;
         border: 2px solid transparent; text-decoration: none; }
-.tab.active { background: #e94560; color: white;
-              border-color: #ff6b6b; }
-
-.card  { background: #16213e; border-radius: 10px;
-         padding: 14px; margin-bottom: 14px; }
-label  { display: block; color: #ffd700; font-size: 12px;
-         margin: 8px 0 3px; }
+.tab.active { background: #e94560; color: white; border-color: #ff6b6b; }
+.card  { background: #16213e; border-radius: 10px; padding: 14px; margin-bottom: 14px; }
+label  { display: block; color: #ffd700; font-size: 12px; margin: 8px 0 3px; }
 input, select { width: 100%; padding: 9px 10px; font-size: 15px;
                 background: #0f3460; color: white;
                 border: 1px solid #00d9ff; border-radius: 6px; }
-
-input:focus { border-color: #ffd700; outline: none;
-              background: #1a2a4a; }
-
+input:focus { border-color: #ffd700; outline: none; background: #1a2a4a; }
 .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 .row3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
-
 .save-btn { width: 100%; margin-top: 12px; padding: 13px;
             font-size: 16px; background: #00d9ff; color: #000;
-            border: none; border-radius: 8px; font-weight: bold;
-            cursor: pointer; }
+            border: none; border-radius: 8px; font-weight: bold; cursor: pointer; }
 .save-btn:active { background: #0099bb; }
-
 .sym-box { background: #0a0e27; border-radius: 8px;
            padding: 10px 12px; margin-bottom: 12px;
            font-size: 13px; line-height: 2; border: 1px solid #00d9ff; }
 .sym-box .label { color: #888; font-size: 11px; }
 .sym-box .val   { color: #00d9ff; font-weight: bold; font-size: 14px; }
 .sym-box .qty-info { color: #ffd700; }
-
-.unsaved { background: #5d4037; border-radius: 6px;
-           padding: 6px 10px; font-size: 12px;
-           margin-bottom: 8px; text-align: center; }
-
-.btn-grid { display: grid; grid-template-columns: 1fr 1fr;
-            gap: 10px; margin-bottom: 10px; }
+.btn-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px; }
 .btn { padding: 22px 10px; font-size: 17px; font-weight: bold;
        border: none; border-radius: 10px; cursor: pointer; width: 100%; }
 .btn:active { opacity: 0.8; transform: scale(0.97); }
-.buy-call  { background: #1b5e20; color: #69f0ae;
-             border: 2px solid #4caf50; }
-.buy-put   { background: #b71c1c; color: #ff8a80;
-             border: 2px solid #f44336; }
-.exit-call { background: #1a237e; color: #82b1ff;
-             border: 2px solid #3f51b5; }
-.exit-put  { background: #4a148c; color: #ea80fc;
-             border: 2px solid #9c27b0; }
+.buy-call  { background: #1b5e20; color: #69f0ae; border: 2px solid #4caf50; }
+.buy-put   { background: #b71c1c; color: #ff8a80; border: 2px solid #f44336; }
+.exit-call { background: #1a237e; color: #82b1ff; border: 2px solid #3f51b5; }
+.exit-put  { background: #4a148c; color: #ea80fc; border: 2px solid #9c27b0; }
 .exit-all  { width: 100%; padding: 16px; font-size: 16px;
              font-weight: bold; background: #e65100; color: white;
-             border: none; border-radius: 10px; cursor: pointer;
-             margin-bottom: 10px; }
+             border: none; border-radius: 10px; cursor: pointer; margin-bottom: 10px; }
 .exit-all:active { opacity: 0.8; }
-
 .flash { padding: 10px 14px; border-radius: 8px; margin-bottom: 10px;
-         font-size: 13px; text-align: center; font-weight: bold;
-         word-break: break-word; }
+         font-size: 13px; text-align: center; font-weight: bold; word-break: break-word; }
 .flash.ok  { background: #1b5e20; color: #69f0ae; }
 .flash.err { background: #7b1c1c; color: #ff8a80; }
-
-.mkt { font-size: 12px; text-align: center;
-       margin-bottom: 10px; color: #aaa; }
+.mkt { font-size: 12px; text-align: center; margin-bottom: 10px; color: #aaa; }
 .mkt .open   { color: #4caf50; }
 .mkt .closed { color: #f44336; }
-
 .log-box { background: #0a0e27; border-radius: 8px; padding: 10px;
            font-size: 11px; color: #0f0; max-height: 160px;
            overflow-y: auto; font-family: monospace; margin-top: 10px; }
-a.back { display: block; text-align: center; margin-top: 14px;
-         color: #00d9ff; font-size: 13px; }
+a.back { display: block; text-align: center; margin-top: 14px; color: #00d9ff; font-size: 13px; }
+.product-badge { display: inline-block; padding: 2px 8px; border-radius: 4px;
+                 font-size: 11px; font-weight: bold; margin-left: 6px; }
+.mis-badge  { background: #1b5e20; color: #69f0ae; }
+.nrml-badge { background: #7b1c1c; color: #ff8a80; }
 </style>
 </head>
 <body>
 
-<h1>⚡ Manual Trading</h1>
+<h1>⚡ Manual Trading
+  <span class="product-badge {{ 'mis-badge' if product == 'I' else 'nrml-badge' }}">
+    {{ 'MIS' if product == 'I' else 'NRML' }}
+  </span>
+</h1>
 
 {% if not token %}
 <div class="warn-box">
-  ❌ Not logged in —
-  <a href="/login" style="color:#ffcdd2">Login first</a>
+  ❌ Not logged in — <a href="/login" style="color:#ffcdd2">Login first</a>
 </div>
 {% else %}
 <div class="ok-box">
@@ -758,12 +718,9 @@ a.back { display: block; text-align: center; margin-top: 14px;
 {% endif %}
 
 <div class="tabs">
-  <a href="/manual?inst=NIFTY"
-     class="tab {{ 'active' if inst=='NIFTY' }}">NIFTY</a>
-  <a href="/manual?inst=BANKNIFTY"
-     class="tab {{ 'active' if inst=='BANKNIFTY' }}">BNIFTY</a>
-  <a href="/manual?inst=CRUDEOIL"
-     class="tab {{ 'active' if inst=='CRUDEOIL' }}">CRUDE</a>
+  <a href="/manual?inst=NIFTY"     class="tab {{ 'active' if inst=='NIFTY' }}">NIFTY</a>
+  <a href="/manual?inst=BANKNIFTY" class="tab {{ 'active' if inst=='BANKNIFTY' }}">BNIFTY</a>
+  <a href="/manual?inst=CRUDEOIL"  class="tab {{ 'active' if inst=='CRUDEOIL' }}">CRUDE</a>
 </div>
 
 {% if msg %}
@@ -775,9 +732,7 @@ a.back { display: block; text-align: center; margin-top: 14px;
   {% if mkt_open %}
     <span class="open">🟢 OPEN</span>
   {% else %}
-    <span class="closed">
-      🔴 CLOSED ({{ mkt_open_time }}–{{ mkt_close_time }} IST)
-    </span>
+    <span class="closed">🔴 CLOSED ({{ mkt_open_time }}–{{ mkt_close_time }} IST)</span>
   {% endif %}
   &nbsp;|&nbsp; {{ time_now }}
 </div>
@@ -786,29 +741,23 @@ a.back { display: block; text-align: center; margin-top: 14px;
   <h2>⚙️ Strike Setup — {{ inst }}</h2>
   <form method="POST" action="/manual/setup" id="setupForm">
     <input type="hidden" name="inst" value="{{ inst }}">
-
     <div class="row3">
       <div>
         <label>Day (DD)</label>
-        <input name="day" id="fDay" value="{{ fday }}"
-               maxlength="2" placeholder="11"
-               oninput="previewSymbol()">
+        <input name="day" id="fDay" value="{{ fday }}" maxlength="2"
+               placeholder="11" oninput="previewSymbol()">
       </div>
       <div>
         <label>Month (MMM)</label>
-        <input name="mon" id="fMon" value="{{ fmon }}"
-               maxlength="3" placeholder="AUG"
-               oninput="previewSymbol()"
-               style="text-transform:uppercase">
+        <input name="mon" id="fMon" value="{{ fmon }}" maxlength="3"
+               placeholder="AUG" oninput="previewSymbol()" style="text-transform:uppercase">
       </div>
       <div>
         <label>Year (YY)</label>
-        <input name="yr" id="fYr" value="{{ fyr }}"
-               maxlength="2" placeholder="26"
-               oninput="previewSymbol()">
+        <input name="yr" id="fYr" value="{{ fyr }}" maxlength="2"
+               placeholder="26" oninput="previewSymbol()">
       </div>
     </div>
-
     <div class="row2">
       <div>
         <label>CE Strike</label>
@@ -821,7 +770,6 @@ a.back { display: block; text-align: center; margin-top: 14px;
                placeholder="same as CE" oninput="previewSymbol()">
       </div>
     </div>
-
     <div class="row2">
       <div>
         <label>Lots</label>
@@ -834,88 +782,62 @@ a.back { display: block; text-align: center; margin-top: 14px;
                value="{{ flots|int * lot_size }}">
       </div>
     </div>
-
-    <div style="margin-top:10px;padding:8px;background:#0a0e27;
-                border-radius:6px;font-size:12px;">
+    <div style="margin-top:10px;padding:8px;background:#0a0e27;border-radius:6px;font-size:12px;">
       <span style="color:#888">Preview: </span>
       <span id="previewCe" style="color:#69f0ae">-</span>
       &nbsp;/&nbsp;
       <span id="previewPe" style="color:#ff8a80">-</span>
     </div>
-
-    <button type="submit" class="save-btn">
-      💾 Save & Activate Strikes
-    </button>
+    <button type="submit" class="save-btn">💾 Save & Activate Strikes</button>
   </form>
 </div>
 
 {% if call_sym and put_sym %}
-
 <div class="sym-box">
   <div class="label">🟢 ACTIVE — Orders will use these symbols:</div>
   <div>CE: <span class="val">{{ call_sym }}</span></div>
   <div>PE: <span class="val">{{ put_sym }}</span></div>
-  <div class="qty-info">
-    📦 Qty: {{ qty }} &nbsp;({{ saved_lots }} lot × {{ lot_size }})
-  </div>
+  <div class="qty-info">📦 Qty: {{ qty }} &nbsp;({{ saved_lots }} lot × {{ lot_size }})</div>
 </div>
 
 <div class="btn-grid">
-
   <form method="POST" action="/manual/order">
     <input type="hidden" name="inst"   value="{{ inst }}">
     <input type="hidden" name="action" value="BUY_CALL">
-    <button type="submit" class="btn buy-call">
-      📈 BUY<br>CALL
-    </button>
+    <button type="submit" class="btn buy-call">📈 BUY<br>CALL</button>
   </form>
-
   <form method="POST" action="/manual/order">
     <input type="hidden" name="inst"   value="{{ inst }}">
     <input type="hidden" name="action" value="BUY_PUT">
-    <button type="submit" class="btn buy-put">
-      📉 BUY<br>PUT
-    </button>
+    <button type="submit" class="btn buy-put">📉 BUY<br>PUT</button>
   </form>
-
   <form method="POST" action="/manual/order">
     <input type="hidden" name="inst"   value="{{ inst }}">
     <input type="hidden" name="action" value="EXIT_CALL">
-    <button type="submit" class="btn exit-call">
-      🚪 EXIT<br>CALL
-    </button>
+    <button type="submit" class="btn exit-call">🚪 EXIT<br>CALL</button>
   </form>
-
   <form method="POST" action="/manual/order">
     <input type="hidden" name="inst"   value="{{ inst }}">
     <input type="hidden" name="action" value="EXIT_PUT">
-    <button type="submit" class="btn exit-put">
-      🚪 EXIT<br>PUT
-    </button>
+    <button type="submit" class="btn exit-put">🚪 EXIT<br>PUT</button>
   </form>
-
 </div>
 
 <form method="POST" action="/manual/order">
   <input type="hidden" name="inst"   value="{{ inst }}">
   <input type="hidden" name="action" value="EXIT_ALL">
-  <button type="submit" class="exit-all">
-    ⛔ EXIT ALL (CE + PE)
-  </button>
+  <button type="submit" class="exit-all">⛔ EXIT ALL (CE + PE)</button>
 </form>
 
 {% else %}
 <div class="warn-box" style="margin-top:10px;">
-  ⚠️ Fill strike details above and tap
-  <b>Save & Activate Strikes</b> to enable trading buttons.
+  ⚠️ Fill strike details above and tap <b>Save & Activate Strikes</b> to enable trading buttons.
 </div>
 {% endif %}
 
 {% if logs %}
 <h2 style="margin-top:14px;">📋 Recent Activity</h2>
-<div class="log-box">
-  {% for l in logs %}{{ l }}<br>{% endfor %}
-</div>
+<div class="log-box">{% for l in logs %}{{ l }}<br>{% endfor %}</div>
 {% endif %}
 
 <a href="/" class="back">← Back to Dashboard</a>
@@ -937,31 +859,28 @@ function previewSymbol() {
 
   if (day && mon && yr && ce) {
     const expiry = day + mon + yr;
-    document.getElementById('previewCe').textContent =
-      inst + expiry + 'C' + ce;
-    document.getElementById('previewPe').textContent =
-      inst + expiry + 'P' + pe;
+    document.getElementById('previewCe').textContent = inst + expiry + 'C' + ce;
+    document.getElementById('previewPe').textContent = inst + expiry + 'P' + pe;
   } else {
     document.getElementById('previewCe').textContent = '-';
     document.getElementById('previewPe').textContent = '-';
   }
 }
-
 previewSymbol();
 </script>
-
 </body>
 </html>
 """
 
-# -----------------------------------------------
+# =============================================
 # ROUTES
-# -----------------------------------------------
+# =============================================
 @app.route("/")
 def home():
     market_status = {name: is_market_open_for(name) for name in INSTRUMENTS}
     return render_template_string(HOME_HTML,
         token=state["token"], dry=DRY_RUN,
+        product=PRODUCT,
         self_url=SELF_URL,
         instruments=INSTRUMENTS,
         market_status=market_status,
@@ -976,8 +895,7 @@ def login():
         if code:
             success, result = exchange_request_code(code)
             msg = "✅ Token generated!" if success else f"❌ {result}"
-    return render_template_string(LOGIN_HTML,
-        msg=msg, success=success, api_key=API_KEY)
+    return render_template_string(LOGIN_HTML, msg=msg, success=success, api_key=API_KEY)
 
 @app.route("/logs")
 def logs_page():
@@ -989,9 +907,7 @@ def logs_page():
 
 @app.route("/ping")
 def ping():
-    """Simple keep-alive endpoint."""
-    return jsonify({"status": "alive",
-                    "time":   datetime.now(IST).strftime("%H:%M:%S")}), 200
+    return jsonify({"status": "alive", "time": datetime.now(IST).strftime("%H:%M:%S")}), 200
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -1006,8 +922,8 @@ def webhook():
             add_log("[WEBHOOK] Secret mismatch.")
             return jsonify({"status": "error", "msg": "unauthorized"}), 403
 
-        action = data.get("action", "")
-        qty_raw = data.get("qty", None)
+        action            = data.get("action", "")
+        qty_raw           = data.get("qty", None)
         symbol_from_alert = data.get("symbol", None)
 
         qty = None
@@ -1017,12 +933,12 @@ def webhook():
             except Exception:
                 qty = None
 
-        t = threading.Thread(
+        threading.Thread(
             target=handle_action,
             args=(action, qty, symbol_from_alert),
             daemon=True
-        )
-        t.start()
+        ).start()
+
         return jsonify({"status": "ok", "action": action,
                         "qty": qty, "symbol": symbol_from_alert}), 200
 
@@ -1036,6 +952,7 @@ def health():
     return jsonify({
         "status":    "running",
         "dry_run":   DRY_RUN,
+        "product":   PRODUCT,
         "token_ok":  bool(state["token"]),
         "keep_alive": bool(SELF_URL),
         "instruments": {
@@ -1047,9 +964,9 @@ def health():
         "time_ist": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
     }), 200
 
-# -----------------------------------------------
+# =============================================
 # MANUAL ROUTES
-# -----------------------------------------------
+# =============================================
 @app.route("/manual", methods=["GET"])
 def manual():
     inst = request.args.get("inst", "NIFTY").upper()
@@ -1062,9 +979,9 @@ def manual():
     now_ist  = datetime.now(IST)
     lot_size = cfg["lot_size"]
 
-    fday  = f["day"]  or now_ist.strftime("%d")
-    fmon  = f["mon"]  or now_ist.strftime("%b").upper()
-    fyr   = f["yr"]   or now_ist.strftime("%y")
+    fday  = f["day"]       or now_ist.strftime("%d")
+    fmon  = f["mon"]       or now_ist.strftime("%b").upper()
+    fyr   = f["yr"]        or now_ist.strftime("%y")
     fce   = f["ce_strike"]
     fpe   = f["pe_strike"]
     flots = f["lots"]
@@ -1075,26 +992,26 @@ def manual():
     recent_logs = [
         l for l in reversed(state["logs"])
         if any(k in l for k in [
-            "[ACTION]", "[ORDER]", "[EXIT]",
-            "[OK]", "[ERR]", "MANUAL", "DRY RUN"
+            "[ACTION]", "[ORDER]", "[EXIT]", "[OK]", "[ERR]", "MANUAL", "DRY RUN"
         ])
     ][:15]
 
     return render_template_string(MANUAL_HTML,
-        inst      = inst,
-        token     = state["token"],
-        dry       = DRY_RUN,
-        call_sym  = m["call"],
-        put_sym   = m["put"],
-        qty       = m["qty"],
-        saved_lots= m["lots"],
-        lot_size  = lot_size,
+        inst       = inst,
+        token      = state["token"],
+        dry        = DRY_RUN,
+        product    = PRODUCT,
+        call_sym   = m["call"],
+        put_sym    = m["put"],
+        qty        = m["qty"],
+        saved_lots = m["lots"],
+        lot_size   = lot_size,
         fday=fday, fmon=fmon, fyr=fyr,
         fce=fce,   fpe=fpe,   flots=flots,
-        mkt_open      = is_market_open_for(inst),
-        mkt_open_time = cfg["market_open"].strftime("%H:%M"),
-        mkt_close_time= cfg["market_close"].strftime("%H:%M"),
-        time_now      = now_ist.strftime("%H:%M:%S"),
+        mkt_open       = is_market_open_for(inst),
+        mkt_open_time  = cfg["market_open"].strftime("%H:%M"),
+        mkt_close_time = cfg["market_close"].strftime("%H:%M"),
+        time_now       = now_ist.strftime("%H:%M:%S"),
         msg    = msg,
         msg_ok = msg_ok,
         logs   = recent_logs,
@@ -1142,10 +1059,7 @@ def manual_setup():
         "lots": lots
     }
 
-    add_log(
-        f"[MANUAL] {inst} | NEW STRIKES SAVED | "
-        f"CE={call_sym} PE={put_sym} QTY={qty}"
-    )
+    add_log(f"[MANUAL] {inst} | NEW STRIKES SAVED | CE={call_sym} PE={put_sym} QTY={qty}")
 
     return redirect_manual(
         inst,
@@ -1161,8 +1075,7 @@ def manual_order():
         return redirect_manual("NIFTY", "❌ Unknown instrument", ok=False)
 
     if not state["token"]:
-        return redirect_manual(inst,
-            "❌ Not logged in. Visit /login", ok=False)
+        return redirect_manual(inst, "❌ Not logged in. Visit /login", ok=False)
 
     m = state["manual"][inst]
     if not m["call"] or not m["put"]:
@@ -1172,10 +1085,7 @@ def manual_order():
     pe  = m["put"]
     qty = m["qty"]
 
-    add_log(
-        f"[MANUAL] {inst} | {action} | "
-        f"CE={ce} PE={pe} QTY={qty}"
-    )
+    add_log(f"[MANUAL] {inst} | {action} | CE={ce} PE={pe} QTY={qty}")
 
     result_holder = {"msg": "", "ok": True}
 
@@ -1183,52 +1093,30 @@ def manual_order():
         try:
             if action == "BUY_CALL":
                 r = place_order(ce, "B", qty)
-                result_holder["msg"] = (
-                    f"✅ BUY CALL sent | {ce} qty={qty}"
-                    if r else f"❌ BUY CALL failed | Check logs"
-                )
+                result_holder["msg"] = (f"✅ BUY CALL sent | {ce} qty={qty}"
+                                        if r else "❌ BUY CALL failed | Check logs")
                 result_holder["ok"] = bool(r)
-
             elif action == "BUY_PUT":
                 r = place_order(pe, "B", qty)
-                result_holder["msg"] = (
-                    f"✅ BUY PUT sent | {pe} qty={qty}"
-                    if r else f"❌ BUY PUT failed | Check logs"
-                )
+                result_holder["msg"] = (f"✅ BUY PUT sent | {pe} qty={qty}"
+                                        if r else "❌ BUY PUT failed | Check logs")
                 result_holder["ok"] = bool(r)
-
             elif action == "EXIT_CALL":
                 r = exit_position(ce)
                 result_holder["msg"] = r or "✅ EXIT CALL done"
-                result_holder["ok"]  = (
-                    r is not None and
-                    "ERROR" not in r and
-                    "failed" not in r.lower()
-                )
-
+                result_holder["ok"]  = r is not None and "ERROR" not in r and "failed" not in r.lower()
             elif action == "EXIT_PUT":
                 r = exit_position(pe)
                 result_holder["msg"] = r or "✅ EXIT PUT done"
-                result_holder["ok"]  = (
-                    r is not None and
-                    "ERROR" not in r and
-                    "failed" not in r.lower()
-                )
-
+                result_holder["ok"]  = r is not None and "ERROR" not in r and "failed" not in r.lower()
             elif action == "EXIT_ALL":
                 r1 = exit_position(ce)
                 r2 = exit_position(pe)
-                result_holder["msg"] = (
-                    f"CE→ {r1 or 'done'} | PE→ {r2 or 'done'}"
-                )
-                result_holder["ok"] = all(
-                    x is not None and "ERROR" not in x
-                    for x in [r1, r2]
-                )
+                result_holder["msg"] = f"CE→ {r1 or 'done'} | PE→ {r2 or 'done'}"
+                result_holder["ok"]  = all(x is not None and "ERROR" not in x for x in [r1, r2])
             else:
                 result_holder["msg"] = f"❌ Unknown: {action}"
                 result_holder["ok"]  = False
-
         except Exception as e:
             result_holder["msg"] = f"❌ Error: {e}"
             result_holder["ok"]  = False
@@ -1238,20 +1126,14 @@ def manual_order():
     t.start()
     t.join(timeout=20)
 
-    return redirect_manual(
-        inst,
-        result_holder["msg"] or "✅ Done",
-        ok=result_holder["ok"]
-    )
+    return redirect_manual(inst, result_holder["msg"] or "✅ Done", ok=result_holder["ok"])
+
 
 def redirect_manual(inst, msg, ok=True):
-    return redirect(
-        f"/manual?inst={inst}"
-        f"&msg={quote(str(msg))}"
-        f"&ok={'1' if ok else '0'}"
-    )
+    return redirect(f"/manual?inst={inst}&msg={quote(str(msg))}&ok={'1' if ok else '0'}")
 
-# -----------------------------------------------
+
+# =============================================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
