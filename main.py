@@ -5,8 +5,8 @@ Replaces Railway US server. Expected latency: 300–800 ms vs 5–6 sec.
 
 SETUP:
   1. Set these environment variables on your hosting platform:
-       FLATRADE_API_KEY   — 
-       FLATRADE_API_SECRET — 
+       FLATRADE_API_KEY   — your Flatrade API key
+       FLATRADE_API_SECRET — your Flatrade API secret
        WEBHOOK_SECRET     — any secret string (paste same in TradingView alert URL)
   2. Deploy (see README.md)
   3. In TradingView alert: set webhook URL to
@@ -14,12 +14,10 @@ SETUP:
 """
 
 import os
-import time
-import hashlib
 import hmac
 import logging
 import httpx
-from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -28,42 +26,23 @@ log = logging.getLogger(__name__)
 app = FastAPI(title="TV→Flatrade Bridge")
 
 # ── Config from env ──────────────────────────────────────────────
-API_KEY      = os.environ.get(" d531157b153e405aabb13012ffb76cb9", "")
-API_SECRET   = os.environ.get("2026.c1d8c2efa998462c88a1e4658bdb3e78b9cb2e0fa98caaca", "")
-WH_SECRET    = os.environ.get("WEBHOOK_SECRET", "raju")
+API_KEY      = os.environ.get("FLATRADE_API_KEY", "")
+API_SECRET   = os.environ.get("FLATRADE_API_SECRET", "")
+WH_SECRET    = os.environ.get("WEBHOOK_SECRET", "changeme")
 
 FLATRADE_BASE = "https://api.flattrade.in"   # update if Flatrade changes this
 
-# ── In-memory token store (refreshed once per session) ──────────
-_token_cache: dict = {"token": None, "expires_at": 0}
+# ── In-memory token store ───────────────────────────────────────
+# Token is pushed daily by running get_token.py on your PC.
+# It does NOT auto-login — Flatrade requires browser OAuth each day.
+_token_cache: dict = {"token": None}
 
-# ─────────────────────────────────────────────────────────────────
-# Flatrade session token (valid for the trading day)
-# ─────────────────────────────────────────────────────────────────
 def _get_token() -> str:
-    now = time.time()
-    if _token_cache["token"] and now < _token_cache["expires_at"]:
-        return _token_cache["token"]
-
-    # SHA-256 hash of api_key + api_secret  (Flatrade login method)
-    raw = API_KEY + API_SECRET
-    sha = hashlib.sha256(raw.encode()).hexdigest()
-
-    resp = httpx.post(
-        f"{FLATRADE_BASE}/trade/apitoken",
-        json={"api_key": API_KEY, "request_code": sha},
-        timeout=10,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-
-    token = data.get("token") or data.get("susertoken") or data.get("SessionToken")
+    token = _token_cache.get("token")
     if not token:
-        raise RuntimeError(f"Token not found in response: {data}")
-
-    _token_cache["token"]      = token
-    _token_cache["expires_at"] = now + 6 * 3600   # 6-hour safety window
-    log.info("Flatrade token refreshed OK")
+        raise RuntimeError(
+            "No token set. Run get_token.py on your PC first to login and push today's token."
+        )
     return token
 
 
@@ -145,25 +124,29 @@ async def webhook(request: Request, secret: str = ""):
 
 
 # ─────────────────────────────────────────────────────────────────
+# Set token — called by get_token.py on your PC every morning
+# POST /set-token?secret=YOUR_SECRET   body: {"token": "..."}
+# ─────────────────────────────────────────────────────────────────
+@app.post("/set-token")
+async def set_token(request: Request, secret: str = ""):
+    if not hmac.compare_digest(secret, WH_SECRET):
+        raise HTTPException(status_code=403, detail="Invalid secret")
+    body = await request.json()
+    token = body.get("token", "").strip()
+    if not token:
+        raise HTTPException(status_code=400, detail="No token provided")
+    _token_cache["token"] = token
+    log.info("Token updated via set-token endpoint")
+    return {"status": "ok", "message": "Token set successfully"}
+
+
+# ─────────────────────────────────────────────────────────────────
 # Health check (Render pings this to keep the dyno alive)
 # ─────────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
-    return {"status": "ok", "token_cached": bool(_token_cache["token"])}
+    token_set = bool(_token_cache.get("token"))
+    return {"status": "ok", "token_set": token_set}
 
 
-# ─────────────────────────────────────────────────────────────────
-# Force token refresh (call this at 9:00 AM IST before market opens)
-# GET /refresh-token?secret=YOUR_SECRET
-# ─────────────────────────────────────────────────────────────────
-@app.get("/refresh-token")
-def refresh_token(secret: str = ""):
-    if not hmac.compare_digest(secret, WH_SECRET):
-        raise HTTPException(status_code=403, detail="Invalid secret")
-    _token_cache["token"]      = None
-    _token_cache["expires_at"] = 0
-    try:
-        _get_token()
-        return {"status": "ok", "message": "Token refreshed"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+
