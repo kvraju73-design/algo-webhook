@@ -1,6 +1,7 @@
 """
 Flattrade MULTI-INSTRUMENT - CLOUD VERSION for Railway v4
 FIXED: Strike price update issue - new strikes now apply immediately
++ KEEP-ALIVE: Background thread pings /health every 4 min to prevent Railway sleep
 """
 
 import os
@@ -28,6 +29,9 @@ PROXY_PASS     = os.environ.get("PROXY_PASS", "")
 PRODUCT        = os.environ.get("PRODUCT", "M")
 DRY_RUN        = os.environ.get("DRY_RUN", "False").lower() == "true"
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
+# ── KEEP-ALIVE: Set your Railway app URL as env var SELF_URL ──
+# e.g. https://your-app-name.up.railway.app
+SELF_URL       = os.environ.get("SELF_URL", "")
 
 PROXIES = {
     "http":  f"http://{PROXY_USER}:{PROXY_PASS}@{PROXY_HOST}:{PROXY_PORT}",
@@ -72,8 +76,7 @@ log = logging.getLogger(__name__)
 logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
 # =============================================
-# STATE - FIXED: added separate form_values
-#         so display always shows what user typed
+# STATE
 # =============================================
 state = {
     "token":       None,
@@ -84,13 +87,10 @@ state = {
     "logs":        [],
     "last_action": {},
     "manual": {
-        # Stores actual order symbols + qty
         "NIFTY":     {"call": "", "put": "", "qty": 65,  "lots": 1},
         "BANKNIFTY": {"call": "", "put": "", "qty": 30,  "lots": 1},
         "CRUDEOIL":  {"call": "", "put": "", "qty": 100, "lots": 1},
     },
-    # ── FIXED: Stores what user typed in form ──
-    # So page always shows fresh typed values
     "form": {
         "NIFTY":     {"day": "", "mon": "", "yr": "",
                       "ce_strike": "", "pe_strike": "", "lots": "1"},
@@ -110,6 +110,34 @@ def add_log(msg):
     state["logs"] = state["logs"][-200:]
     log.info(msg)
     return entry
+
+# =============================================
+# KEEP-ALIVE THREAD
+# Pings /health on this app every 4 minutes
+# so Railway free plan never puts it to sleep
+# =============================================
+def keep_alive_loop():
+    # Wait 30s after startup before first ping
+    time.sleep(30)
+    while True:
+        try:
+            if SELF_URL:
+                url = f"{SELF_URL.rstrip('/')}/health"
+                r   = requests.get(url, timeout=10)
+                log.info(f"[KEEP-ALIVE] Pinged {url} → {r.status_code}")
+            else:
+                log.warning("[KEEP-ALIVE] SELF_URL not set — ping skipped. "
+                            "Add SELF_URL env var in Railway.")
+        except Exception as e:
+            log.warning(f"[KEEP-ALIVE] Ping failed: {e}")
+        # Sleep 4 minutes (Railway sleeps after ~5 min of inactivity)
+        time.sleep(4 * 60)
+
+keep_alive_thread = threading.Thread(
+    target=keep_alive_loop, daemon=True, name="keep-alive"
+)
+keep_alive_thread.start()
+log.info("[KEEP-ALIVE] Background ping thread started.")
 
 # -----------------------------------------------
 # INSTRUMENT DETECTION
@@ -352,7 +380,6 @@ def exit_position(symbol):
             add_log("[EXIT] No open positions found.")
             return "ERROR: No positions"
 
-        # ── Fuzzy symbol matching ──
         def symbols_match(pos_sym, target_sym):
             if pos_sym == target_sym:
                 return True
@@ -489,7 +516,6 @@ def handle_action(action, qty=None, symbol=None):
             add_log(f"[ACTION] Unknown action: {action}")
         return
 
-    # Fallback: use /setup strikes
     ce  = state["call_symbol"]
     pe  = state["put_symbol"]
     qty = qty or state["qty"]
@@ -551,6 +577,10 @@ code{background:#0a0e27;padding:3px 6px;border-radius:3px;color:#00d9ff;}
 <b>Mode:</b>
 <span class="{{ 'warn' if dry else 'ok' }}">
   {{ 'DRY RUN' if dry else 'LIVE' }}
+</span><br>
+<b>Keep-Alive:</b>
+<span class="{{ 'ok' if self_url else 'warn' }}">
+  {{ '✅ Active → ' + self_url if self_url else '⚠️ SELF_URL not set' }}
 </span><br>
 <b>Server Time (IST):</b> {{ time_now }}
 </div>
@@ -614,11 +644,6 @@ input{width:100%;padding:10px;font-size:16px;background:#0f3460;
 </body></html>
 """
 
-# ── FIXED MANUAL HTML ──
-# Key changes:
-# 1. Form values come from state["form"][inst] - not re-parsed from symbol
-# 2. On save, form values stored separately from order symbols
-# 3. Clear visual confirmation of what was saved
 MANUAL_HTML = """
 <!DOCTYPE html>
 <html>
@@ -656,7 +681,6 @@ input, select { width: 100%; padding: 9px 10px; font-size: 15px;
                 background: #0f3460; color: white;
                 border: 1px solid #00d9ff; border-radius: 6px; }
 
-/* FIXED: Highlight changed field */
 input:focus { border-color: #ffd700; outline: none;
               background: #1a2a4a; }
 
@@ -669,7 +693,6 @@ input:focus { border-color: #ffd700; outline: none;
             cursor: pointer; }
 .save-btn:active { background: #0099bb; }
 
-/* FIXED: Active symbol box shows CURRENT saved symbols clearly */
 .sym-box { background: #0a0e27; border-radius: 8px;
            padding: 10px 12px; margin-bottom: 12px;
            font-size: 13px; line-height: 2; border: 1px solid #00d9ff; }
@@ -677,7 +700,6 @@ input:focus { border-color: #ffd700; outline: none;
 .sym-box .val   { color: #00d9ff; font-weight: bold; font-size: 14px; }
 .sym-box .qty-info { color: #ffd700; }
 
-/* FIXED: Unsaved warning shown when form differs from saved */
 .unsaved { background: #5d4037; border-radius: 6px;
            padding: 6px 10px; font-size: 12px;
            margin-bottom: 8px; text-align: center; }
@@ -735,7 +757,6 @@ a.back { display: block; text-align: center; margin-top: 14px;
 </div>
 {% endif %}
 
-<!-- Instrument Tabs -->
 <div class="tabs">
   <a href="/manual?inst=NIFTY"
      class="tab {{ 'active' if inst=='NIFTY' }}">NIFTY</a>
@@ -745,12 +766,10 @@ a.back { display: block; text-align: center; margin-top: 14px;
      class="tab {{ 'active' if inst=='CRUDEOIL' }}">CRUDE</a>
 </div>
 
-<!-- Flash message -->
 {% if msg %}
 <div class="flash {{ 'ok' if msg_ok else 'err' }}">{{ msg }}</div>
 {% endif %}
 
-<!-- Market Status -->
 <div class="mkt">
   Market:
   {% if mkt_open %}
@@ -763,38 +782,28 @@ a.back { display: block; text-align: center; margin-top: 14px;
   &nbsp;|&nbsp; {{ time_now }}
 </div>
 
-<!-- ═══════════════════════════════════════════
-     STRIKE SETUP FORM
-     Values come from state["form"][inst]
-     NOT re-parsed from saved symbol
-     ═══════════════════════════════════════════ -->
 <div class="card">
   <h2>⚙️ Strike Setup — {{ inst }}</h2>
-  <form method="POST" action="/manual/setup"
-        id="setupForm">
+  <form method="POST" action="/manual/setup" id="setupForm">
     <input type="hidden" name="inst" value="{{ inst }}">
 
     <div class="row3">
       <div>
         <label>Day (DD)</label>
-        <!-- FIXED: value="{{ fday }}" from form state -->
-        <input name="day" id="fDay"
-               value="{{ fday }}"
+        <input name="day" id="fDay" value="{{ fday }}"
                maxlength="2" placeholder="11"
                oninput="previewSymbol()">
       </div>
       <div>
         <label>Month (MMM)</label>
-        <input name="mon" id="fMon"
-               value="{{ fmon }}"
+        <input name="mon" id="fMon" value="{{ fmon }}"
                maxlength="3" placeholder="AUG"
                oninput="previewSymbol()"
                style="text-transform:uppercase">
       </div>
       <div>
         <label>Year (YY)</label>
-        <input name="yr" id="fYr"
-               value="{{ fyr }}"
+        <input name="yr" id="fYr" value="{{ fyr }}"
                maxlength="2" placeholder="26"
                oninput="previewSymbol()">
       </div>
@@ -803,36 +812,29 @@ a.back { display: block; text-align: center; margin-top: 14px;
     <div class="row2">
       <div>
         <label>CE Strike</label>
-        <input name="ce" id="fCe"
-               value="{{ fce }}"
-               placeholder="24500"
-               oninput="previewSymbol()">
+        <input name="ce" id="fCe" value="{{ fce }}"
+               placeholder="24500" oninput="previewSymbol()">
       </div>
       <div>
         <label>PE Strike</label>
-        <input name="pe" id="fPe"
-               value="{{ fpe }}"
-               placeholder="same as CE"
-               oninput="previewSymbol()">
+        <input name="pe" id="fPe" value="{{ fpe }}"
+               placeholder="same as CE" oninput="previewSymbol()">
       </div>
     </div>
 
     <div class="row2">
       <div>
         <label>Lots</label>
-        <input name="lots" id="fLots"
-               type="number" value="{{ flots }}"
+        <input name="lots" id="fLots" type="number" value="{{ flots }}"
                min="1" oninput="previewSymbol()">
       </div>
       <div>
         <label>Qty</label>
-        <input id="fQtyDisplay" disabled
-               style="color:#ffd700"
+        <input id="fQtyDisplay" disabled style="color:#ffd700"
                value="{{ flots|int * lot_size }}">
       </div>
     </div>
 
-    <!-- FIXED: Live preview of what will be saved -->
     <div style="margin-top:10px;padding:8px;background:#0a0e27;
                 border-radius:6px;font-size:12px;">
       <span style="color:#888">Preview: </span>
@@ -847,10 +849,6 @@ a.back { display: block; text-align: center; margin-top: 14px;
   </form>
 </div>
 
-<!-- ═══════════════════════════════════════════
-     ACTIVE SYMBOLS DISPLAY
-     Shows CURRENTLY SAVED symbols for trading
-     ═══════════════════════════════════════════ -->
 {% if call_sym and put_sym %}
 
 <div class="sym-box">
@@ -862,7 +860,6 @@ a.back { display: block; text-align: center; margin-top: 14px;
   </div>
 </div>
 
-<!-- Trading Buttons -->
 <div class="btn-grid">
 
   <form method="POST" action="/manual/order">
@@ -914,7 +911,6 @@ a.back { display: block; text-align: center; margin-top: 14px;
 </div>
 {% endif %}
 
-<!-- Recent Logs -->
 {% if logs %}
 <h2 style="margin-top:14px;">📋 Recent Activity</h2>
 <div class="log-box">
@@ -924,7 +920,6 @@ a.back { display: block; text-align: center; margin-top: 14px;
 
 <a href="/" class="back">← Back to Dashboard</a>
 
-<!-- FIXED: Live symbol preview script -->
 <script>
 const inst    = "{{ inst }}";
 const lotSize = {{ lot_size }};
@@ -952,7 +947,6 @@ function previewSymbol() {
   }
 }
 
-// Run once on load to show current preview
 previewSymbol();
 </script>
 
@@ -968,6 +962,7 @@ def home():
     market_status = {name: is_market_open_for(name) for name in INSTRUMENTS}
     return render_template_string(HOME_HTML,
         token=state["token"], dry=DRY_RUN,
+        self_url=SELF_URL,
         instruments=INSTRUMENTS,
         market_status=market_status,
         time_now=datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
@@ -991,6 +986,12 @@ def logs_page():
         f"<pre style='background:#000;color:#0f0;"
         f"padding:20px;font-size:13px;'>{lines}</pre>"
     )
+
+@app.route("/ping")
+def ping():
+    """Simple keep-alive endpoint."""
+    return jsonify({"status": "alive",
+                    "time":   datetime.now(IST).strftime("%H:%M:%S")}), 200
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -1033,8 +1034,10 @@ def webhook():
 def health():
     market_status = {name: is_market_open_for(name) for name in INSTRUMENTS}
     return jsonify({
-        "status":   "running", "dry_run": DRY_RUN,
-        "token_ok": bool(state["token"]),
+        "status":    "running",
+        "dry_run":   DRY_RUN,
+        "token_ok":  bool(state["token"]),
+        "keep_alive": bool(SELF_URL),
         "instruments": {
             name: {"exchange":    cfg["exchange"],
                    "lot_size":    cfg["lot_size"],
@@ -1045,7 +1048,7 @@ def health():
     }), 200
 
 # -----------------------------------------------
-# MANUAL ROUTES - FIXED
+# MANUAL ROUTES
 # -----------------------------------------------
 @app.route("/manual", methods=["GET"])
 def manual():
@@ -1055,12 +1058,10 @@ def manual():
 
     cfg      = INSTRUMENTS[inst]
     m        = state["manual"][inst]
-    f        = state["form"][inst]          # ← FIXED: read form state
+    f        = state["form"][inst]
     now_ist  = datetime.now(IST)
     lot_size = cfg["lot_size"]
 
-    # ── FIXED: Form displays what user last typed ──
-    # Default to today's date only if form never filled
     fday  = f["day"]  or now_ist.strftime("%d")
     fmon  = f["mon"]  or now_ist.strftime("%b").upper()
     fyr   = f["yr"]   or now_ist.strftime("%y")
@@ -1083,16 +1084,13 @@ def manual():
         inst      = inst,
         token     = state["token"],
         dry       = DRY_RUN,
-        # ── Active trading symbols ──
         call_sym  = m["call"],
         put_sym   = m["put"],
         qty       = m["qty"],
         saved_lots= m["lots"],
         lot_size  = lot_size,
-        # ── FIXED: Form values from form state ──
         fday=fday, fmon=fmon, fyr=fyr,
         fce=fce,   fpe=fpe,   flots=flots,
-        # ── Market info ──
         mkt_open      = is_market_open_for(inst),
         mkt_open_time = cfg["market_open"].strftime("%H:%M"),
         mkt_close_time= cfg["market_close"].strftime("%H:%M"),
@@ -1111,7 +1109,6 @@ def manual_setup():
     cfg      = INSTRUMENTS[inst]
     lot_size = cfg["lot_size"]
 
-    # Read form values
     day  = request.form.get("day",  "").strip().zfill(2)
     mon  = request.form.get("mon",  "").strip().upper()
     yr   = request.form.get("yr",   "").strip()
@@ -1119,31 +1116,25 @@ def manual_setup():
     pe   = request.form.get("pe",   "").strip()
     lots = max(1, int(request.form.get("lots", "1") or "1"))
 
-    # Validate
     if not all([day, mon, yr, ce]):
         return redirect_manual(inst, "❌ Fill Day/Mon/Yr/CE!", ok=False)
 
-    # PE defaults to CE if blank
     pe_final = pe if pe else ce
 
-    # ── FIXED: Save form values to form state FIRST ──
-    # This ensures page always shows what user typed
     state["form"][inst] = {
         "day":       day,
         "mon":       mon,
         "yr":        yr,
         "ce_strike": ce,
-        "pe_strike": pe,      # keep blank if user left blank
+        "pe_strike": pe,
         "lots":      str(lots)
     }
 
-    # Build symbols
     expiry   = f"{day}{mon}{yr}"
     call_sym = f"{inst}{expiry}C{ce}"
     put_sym  = f"{inst}{expiry}P{pe_final}"
     qty      = lots * lot_size
 
-    # ── FIXED: Save order symbols separately ──
     state["manual"][inst] = {
         "call": call_sym,
         "put":  put_sym,
@@ -1177,7 +1168,6 @@ def manual_order():
     if not m["call"] or not m["put"]:
         return redirect_manual(inst, "❌ Set strikes first!", ok=False)
 
-    # ── FIXED: Read CURRENT symbols at time of button press ──
     ce  = m["call"]
     pe  = m["put"]
     qty = m["qty"]
