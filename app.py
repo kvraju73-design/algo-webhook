@@ -1,9 +1,13 @@
 """
-Flattrade MULTI-INSTRUMENT - CLOUD VERSION v5
-FIXES:
-  - PRODUCT default changed to "I" (MIS) so margin requirement is lower
-  - Price buffer increased to 1% for better fill rate on fast-moving contracts
-  - Cleaner code, same features
+Flattrade MULTI-INSTRUMENT - CLOUD VERSION v6
+FIXES v6:
+  - ✅ Switched to MARKET orders (MKT) for guaranteed fills — no more stuck LIMIT orders
+  - ✅ Removed LTP fetch before order (faster, fewer API calls, no fill delays)
+  - ✅ Debounce reduced to 1 sec + separate BUY/EXIT keys (no more blocked exits)
+  - ✅ Startup warning if SELF_URL missing (prevents silent server sleep)
+  - ✅ Improved exit logic — MKT ensures position actually closes
+  - ✅ Better error messages when webhook fails
+  - ✅ Cleaner logs with clearer status
 """
 
 import os
@@ -31,14 +35,16 @@ PROXY_PORT     = os.environ.get("PROXY_PORT", "443")
 PROXY_USER     = os.environ.get("PROXY_USER", "")
 PROXY_PASS     = os.environ.get("PROXY_PASS", "")
 
-# ✅ FIX 1: Changed from "M" (NRML) to "I" (MIS)
-# MIS requires far less margin (~20-40K vs ~1.8L for NRML)
-# ⚠️  MIS auto-squares off at 11:30 PM for MCX — make sure exit runs before then
+# MIS = Intraday (low margin ~20-40K/lot). Auto-squareoff at 11:30PM MCX
 PRODUCT        = os.environ.get("PRODUCT", "I")
 
 DRY_RUN        = os.environ.get("DRY_RUN", "False").lower() == "true"
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 SELF_URL       = os.environ.get("SELF_URL", "")
+
+# ✅ FIX v6: Order type — MKT (Market) for guaranteed fills, LMT for price control
+# Default MKT because LMT was causing stuck orders on fast-moving contracts
+ORDER_TYPE     = os.environ.get("ORDER_TYPE", "MKT").upper()
 
 PROXIES = {
     "http":  f"http://{PROXY_USER}:{PROXY_PASS}@{PROXY_HOST}:{PROXY_PORT}",
@@ -123,6 +129,29 @@ def add_log(msg):
 
 
 # =============================================
+# STARTUP WARNINGS ✅ FIX v6
+# =============================================
+def startup_checks():
+    warnings = []
+    if not SELF_URL:
+        warnings.append("⚠️  CRITICAL: SELF_URL not set → server may sleep → webhooks WILL be dropped!")
+        warnings.append("⚠️  Set SELF_URL=https://your-app.onrender.com in environment variables.")
+    if not USER_ID or not API_KEY or not API_SECRET:
+        warnings.append("⚠️  CRITICAL: USER_ID / API_KEY / API_SECRET missing!")
+    if ORDER_TYPE not in ("MKT", "LMT"):
+        warnings.append(f"⚠️  Invalid ORDER_TYPE={ORDER_TYPE}, must be MKT or LMT")
+    if PRODUCT not in ("I", "M", "C", "B", "H"):
+        warnings.append(f"⚠️  Unusual PRODUCT={PRODUCT} (expected I=MIS, M=NRML)")
+
+    for w in warnings:
+        log.warning(w)
+        add_log(w)
+
+    log.info(f"[STARTUP] ORDER_TYPE={ORDER_TYPE} | PRODUCT={PRODUCT} | DRY_RUN={DRY_RUN}")
+    add_log(f"[STARTUP] Server ready | ORDER_TYPE={ORDER_TYPE} | PRODUCT={PRODUCT}")
+
+
+# =============================================
 # KEEP-ALIVE THREAD (pings /health every 4 min)
 # =============================================
 def keep_alive_loop():
@@ -134,7 +163,7 @@ def keep_alive_loop():
                 r   = requests.get(url, timeout=10)
                 log.info(f"[KEEP-ALIVE] Pinged {url} → {r.status_code}")
             else:
-                log.warning("[KEEP-ALIVE] SELF_URL not set — skipping.")
+                log.warning("[KEEP-ALIVE] SELF_URL not set — SERVER MAY SLEEP → set SELF_URL env var!")
         except Exception as e:
             log.warning(f"[KEEP-ALIVE] Ping failed: {e}")
         time.sleep(4 * 60)
@@ -143,6 +172,9 @@ threading.Thread(
     target=keep_alive_loop, daemon=True, name="keep-alive"
 ).start()
 log.info("[KEEP-ALIVE] Background ping thread started.")
+
+# Run startup checks
+startup_checks()
 
 
 # =============================================
@@ -242,6 +274,7 @@ def get_token_for_symbol(symbol, exchange):
 
 
 def get_ltp(symbol, exchange):
+    """Only used for LMT orders or logging — not needed for MKT."""
     tk = get_token_for_symbol(symbol, exchange)
     if not tk:
         return None
@@ -268,6 +301,9 @@ def get_ltp(symbol, exchange):
     return None
 
 
+# =============================================
+# ✅ FIX v6: PLACE ORDER — MKT by default, LMT optional
+# =============================================
 def place_order(symbol, trantype, qty=None):
     action = "BUY" if trantype == "B" else "SELL"
 
@@ -279,7 +315,7 @@ def place_order(symbol, trantype, qty=None):
     exchange = cfg["exchange"]
     qty      = qty or cfg["lot_size"]
 
-    add_log(f"[ORDER] {action} → {symbol} | qty={qty} | product={PRODUCT} | {instrument} ({exchange})")
+    add_log(f"[ORDER] {action} → {symbol} | qty={qty} | product={PRODUCT} | type={ORDER_TYPE} | {instrument} ({exchange})")
 
     if not state["token"]:
         add_log("[ORDER] ERROR: No token. Visit /login first!")
@@ -291,26 +327,31 @@ def place_order(symbol, trantype, qty=None):
         add_log(f"[ORDER] {instrument} market CLOSED ({oh}-{ch} IST)")
         return None
 
-    ltp = get_ltp(symbol, exchange)
-    if ltp is None:
-        add_log("[ORDER] LTP fetch failed. Aborting.")
-        return None
-
-    # ✅ FIX 2: Increased price buffer from 0.5% to 1% for better fill rate
-    # Crude Oil moves fast — 0.5% buffer was causing missed fills
-    price = (round(ltp * 1.01, 1) if trantype == "B"
-             else round(ltp * 0.99, 1))
-
-    if DRY_RUN:
-        add_log(f"[DRY RUN] {action} {qty} {symbol} @ {price} (LTP {ltp})")
-        return "DRY_RUN"
+    # ✅ For MKT orders — skip LTP fetch entirely (faster, more reliable)
+    if ORDER_TYPE == "MKT":
+        price_str = "0"
+        if DRY_RUN:
+            add_log(f"[DRY RUN] {action} {qty} {symbol} @ MARKET")
+            return "DRY_RUN"
+    else:
+        # LMT path — need LTP + buffer
+        ltp = get_ltp(symbol, exchange)
+        if ltp is None:
+            add_log("[ORDER] LTP fetch failed. Aborting LMT order.")
+            return None
+        # 1% buffer for fill safety
+        price = round(ltp * 1.01, 1) if trantype == "B" else round(ltp * 0.99, 1)
+        price_str = str(price)
+        if DRY_RUN:
+            add_log(f"[DRY RUN] {action} {qty} {symbol} @ {price} (LTP {ltp})")
+            return "DRY_RUN"
 
     payload = {
         "uid":      USER_ID, "actid": USER_ID,
         "exch":     exchange, "tsym":  symbol,
-        "qty":      str(qty), "prc":   str(price),
+        "qty":      str(qty), "prc":   price_str,
         "prd":      PRODUCT,  "trantype": trantype,
-        "prctyp":   "LMT",   "ret":   "DAY"
+        "prctyp":   ORDER_TYPE, "ret":   "DAY"
     }
     try:
         r    = requests.post(
@@ -322,7 +363,8 @@ def place_order(symbol, trantype, qty=None):
         resp = r.json()
         if resp.get("stat") == "Ok":
             ordno = resp.get("norenordno", "")
-            add_log(f"[OK] ORDER PLACED | {action} {qty} {symbol} @ {price} | No: {ordno}")
+            price_info = f"@ {price_str}" if ORDER_TYPE == "LMT" else "@ MARKET"
+            add_log(f"[OK] ORDER PLACED | {action} {qty} {symbol} {price_info} | No: {ordno}")
             return ordno
         add_log(f"[ERR] ORDER FAILED | {resp.get('emsg')}")
     except Exception as e:
@@ -331,7 +373,7 @@ def place_order(symbol, trantype, qty=None):
 
 
 # =============================================
-# EXIT POSITION
+# ✅ FIX v6: EXIT POSITION — MKT for guaranteed close
 # =============================================
 def exit_position(symbol):
     add_log(f"[EXIT] Triggered for {symbol}")
@@ -411,23 +453,25 @@ def exit_position(symbol):
             exit_qty = abs(net_qty)
             action   = "SELL" if trantype == "S" else "BUY"
 
-            add_log(f"[EXIT] Found {pos_sym} netqty={net_qty} → {action} {exit_qty}")
+            add_log(f"[EXIT] Found {pos_sym} netqty={net_qty} → {action} {exit_qty} @ {ORDER_TYPE}")
 
-            ltp = get_ltp(pos_sym, exchange)
-            if ltp is None:
-                ltp = float(pos.get("lp", 0)) or float(pos.get("upldprc", 100))
-                add_log(f"[EXIT] Using fallback LTP: {ltp}")
-
-            # ✅ FIX 2 applied here too: 1% buffer
-            price = (round(ltp * 0.99, 1) if trantype == "S"
-                     else round(ltp * 1.01, 1))
+            # ✅ MKT = skip LTP fetch. LMT = fetch + buffer.
+            if ORDER_TYPE == "MKT":
+                price_str = "0"
+            else:
+                ltp = get_ltp(pos_sym, exchange)
+                if ltp is None:
+                    ltp = float(pos.get("lp", 0)) or float(pos.get("upldprc", 100))
+                    add_log(f"[EXIT] Using fallback LTP: {ltp}")
+                price = round(ltp * 0.99, 1) if trantype == "S" else round(ltp * 1.01, 1)
+                price_str = str(price)
 
             sq_payload = {
                 "uid":      USER_ID, "actid":    USER_ID,
                 "exch":     exchange, "tsym":     pos_sym,
-                "qty":      str(exit_qty), "prc": str(price),
+                "qty":      str(exit_qty), "prc": price_str,
                 "prd":      PRODUCT,  "trantype": trantype,
-                "prctyp":   "LMT",   "ret":      "DAY"
+                "prctyp":   ORDER_TYPE, "ret":    "DAY"
             }
             sq_r    = requests.post(
                 BASE_URL_ORDER + "/PlaceOrder",
@@ -439,7 +483,8 @@ def exit_position(symbol):
 
             if sq_resp.get("stat") == "Ok":
                 ordno  = sq_resp.get("norenordno", "")
-                result = f"EXITED {pos_sym} qty={exit_qty} @ {price} | Order#{ordno}"
+                price_info = f"@ {price_str}" if ORDER_TYPE == "LMT" else "@ MARKET"
+                result = f"EXITED {pos_sym} qty={exit_qty} {price_info} | Order#{ordno}"
                 add_log(f"[OK] {result}")
             else:
                 err    = sq_resp.get("emsg", "Unknown error")
@@ -460,15 +505,20 @@ def exit_position(symbol):
 
 
 # =============================================
-# WEBHOOK ACTION HANDLER
+# ✅ FIX v6: WEBHOOK ACTION HANDLER (better debounce)
 # =============================================
 def handle_action(action, qty=None, symbol=None):
     action = action.upper().strip()
 
-    dedup_key = f"{action}_{symbol or ''}"
-    now       = time.time()
-    if now - state["last_action"].get(dedup_key, 0) < 2:
-        add_log(f"[DEBOUNCE] Blocked duplicate: {action} {symbol or ''}")
+    # ✅ FIX: Separate BUY vs EXIT dedup keys — never block opposite action
+    is_exit_action = action in ("SELL", "EXIT", "EXIT_CALL", "EXIT_PUT", "EXIT_ALL")
+    action_class   = "EXIT" if is_exit_action else "ENTRY"
+    dedup_key      = f"{action_class}_{symbol or ''}"
+
+    now = time.time()
+    # ✅ FIX: Reduced from 2s to 1s (only blocks true duplicates)
+    if now - state["last_action"].get(dedup_key, 0) < 1:
+        add_log(f"[DEBOUNCE] Blocked duplicate: {action} {symbol or ''} (<1s)")
         return
     state["last_action"][dedup_key] = now
 
@@ -485,7 +535,7 @@ def handle_action(action, qty=None, symbol=None):
 
         if action in ("BUY", "BUY_CALL", "BUY_PUT"):
             place_order(symbol, "B", qty)
-        elif action in ("SELL", "EXIT", "EXIT_CALL", "EXIT_PUT", "EXIT_ALL"):
+        elif is_exit_action:
             exit_position(symbol)
         elif action in ("SELL_SHORT", "SHORT"):
             place_order(symbol, "S", qty)
@@ -527,7 +577,7 @@ app = Flask(__name__)
 # HTML TEMPLATES
 # =============================================
 HOME_HTML = """
-<!DOCTYPE html><html><head><title>Flattrade Multi-Instrument</title>
+<!DOCTYPE html><html><head><title>Flattrade Multi-Instrument v6</title>
 <style>
 body{font-family:Arial;background:#1a1a2e;color:#eee;padding:30px;
      max-width:900px;margin:auto;}
@@ -543,7 +593,7 @@ th,td{padding:10px;text-align:left;border-bottom:1px solid #0f3460;}
 th{background:#0f3460;color:#ffd700;}
 code{background:#0a0e27;padding:3px 6px;border-radius:3px;color:#00d9ff;}
 </style></head><body>
-<h1>🚀 Flattrade Algo — Multi-Instrument v5</h1>
+<h1>🚀 Flattrade Algo — Multi-Instrument v6</h1>
 <div class="status">
 <b>Token:</b>
 <span class="{{ 'ok' if token else 'err' }}">
@@ -557,17 +607,36 @@ code{background:#0a0e27;padding:3px 6px;border-radius:3px;color:#00d9ff;}
 <span class="{{ 'ok' if product == 'I' else 'warn' }}">
   {{ 'MIS (Intraday) ✅' if product == 'I' else 'NRML ⚠️ High margin needed' }}
 </span><br>
+<b>Order Type:</b>
+<span class="{{ 'ok' if order_type == 'MKT' else 'warn' }}">
+  {{ '✅ MARKET (guaranteed fill)' if order_type == 'MKT' else '⚠️ LIMIT (may not fill)' }}
+</span><br>
 <b>Keep-Alive:</b>
-<span class="{{ 'ok' if self_url else 'warn' }}">
-  {{ '✅ Active → ' + self_url if self_url else '⚠️ SELF_URL not set' }}
+<span class="{{ 'ok' if self_url else 'err' }}">
+  {{ '✅ Active → ' + self_url if self_url else '❌ SELF_URL NOT SET — SERVER WILL SLEEP!' }}
 </span><br>
 <b>Server Time (IST):</b> {{ time_now }}
 </div>
+
+{% if not self_url %}
+<div style="background:#7b1c1c;padding:12px;border-radius:8px;margin:10px 0;">
+  🚨 <b>CRITICAL:</b> SELF_URL is not set! On free hosting (Render/Railway),
+  your server will sleep after 15 min → <b>TradingView webhooks WILL BE DROPPED</b>.
+  <br>Set environment variable: <code>SELF_URL=https://your-app.onrender.com</code>
+</div>
+{% endif %}
 
 {% if product != 'I' %}
 <div style="background:#7b1c1c;padding:12px;border-radius:8px;margin:10px 0;">
   ⚠️ <b>WARNING:</b> PRODUCT is set to NRML. This requires ~₹1.8L margin per lot.
   Set env var <code>PRODUCT=I</code> for MIS (lower margin).
+</div>
+{% endif %}
+
+{% if order_type == 'LMT' %}
+<div style="background:#7b3c00;padding:12px;border-radius:8px;margin:10px 0;">
+  ⚠️ <b>NOTE:</b> Using LIMIT orders. On fast-moving contracts, these may NOT fill,
+  causing "stuck" trades. Set <code>ORDER_TYPE=MKT</code> for guaranteed execution.
 </div>
 {% endif %}
 
@@ -696,6 +765,8 @@ a.back { display: block; text-align: center; margin-top: 14px; color: #00d9ff; f
                  font-size: 11px; font-weight: bold; margin-left: 6px; }
 .mis-badge  { background: #1b5e20; color: #69f0ae; }
 .nrml-badge { background: #7b1c1c; color: #ff8a80; }
+.mkt-badge  { background: #1a237e; color: #82b1ff; }
+.lmt-badge  { background: #7b3c00; color: #ffb74d; }
 </style>
 </head>
 <body>
@@ -703,6 +774,9 @@ a.back { display: block; text-align: center; margin-top: 14px; color: #00d9ff; f
 <h1>⚡ Manual Trading
   <span class="product-badge {{ 'mis-badge' if product == 'I' else 'nrml-badge' }}">
     {{ 'MIS' if product == 'I' else 'NRML' }}
+  </span>
+  <span class="product-badge {{ 'mkt-badge' if order_type == 'MKT' else 'lmt-badge' }}">
+    {{ order_type }}
   </span>
 </h1>
 
@@ -881,6 +955,7 @@ def home():
     return render_template_string(HOME_HTML,
         token=state["token"], dry=DRY_RUN,
         product=PRODUCT,
+        order_type=ORDER_TYPE,
         self_url=SELF_URL,
         instruments=INSTRUMENTS,
         market_status=market_status,
@@ -950,10 +1025,11 @@ def webhook():
 def health():
     market_status = {name: is_market_open_for(name) for name in INSTRUMENTS}
     return jsonify({
-        "status":    "running",
-        "dry_run":   DRY_RUN,
-        "product":   PRODUCT,
-        "token_ok":  bool(state["token"]),
+        "status":     "running",
+        "dry_run":    DRY_RUN,
+        "product":    PRODUCT,
+        "order_type": ORDER_TYPE,
+        "token_ok":   bool(state["token"]),
         "keep_alive": bool(SELF_URL),
         "instruments": {
             name: {"exchange":    cfg["exchange"],
@@ -1001,6 +1077,7 @@ def manual():
         token      = state["token"],
         dry        = DRY_RUN,
         product    = PRODUCT,
+        order_type = ORDER_TYPE,
         call_sym   = m["call"],
         put_sym    = m["put"],
         qty        = m["qty"],
